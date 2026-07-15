@@ -1,12 +1,48 @@
 import time
 import paramiko
 import serial
+import re
 from typing import Optional
 from getpass import getpass
 import os
 from datetime import datetime
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
+
+
+# Match ANSI escape sequences (colors, cursor moves, clears, etc.)
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+# Match other control sequences (OSC, single-shift, etc.)
+_CTRL_RE = re.compile(r'\x1b\][^\x07]*\x07|\x1b[=>]')
+
+
+def _clean_terminal_output(text: str) -> str:
+    """Strip ANSI escape codes and normalize carriage-return progress bars.
+
+    Programs like pip, apt, wget write progress updates using '\\r' to overwrite
+    the current line. Without a real terminal the raw stream concatenates every
+    frame, producing a wall of junk. We keep only the last segment of each
+    '\\r'-delimited line so the output shows the final state, not every frame.
+    """
+    # Remove ANSI escape sequences.
+    text = _ANSI_RE.sub('', text)
+    text = _CTRL_RE.sub('', text)
+    # Normalize CRLF -> LF, then handle \r-only (progress bar overwrite).
+    text = text.replace('\r\n', '\n')
+    # For each \r, keep only the content after the last \r on that line segment
+    # (this collapses "downloading... 1%\rdownloading... 2%\r..." into the final state).
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        if '\r' in line:
+            # Keep the last segment after the final \r (the final state of the progress line)
+            cleaned_lines.append(line.split('\r')[-1])
+        else:
+            cleaned_lines.append(line)
+    result = '\n'.join(cleaned_lines)
+    # Remove other control characters except \n and \t.
+    result = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', result)
+    return result
 
 
 import audit
@@ -408,7 +444,7 @@ class ConnectionManager:
                     if channel.recv_ready():
                         chunk_bytes = channel.recv(1024)
                         if chunk_bytes:
-                            chunk = chunk_bytes.decode('utf-8', errors='replace')
+                            chunk = _clean_terminal_output(chunk_bytes.decode('utf-8', errors='replace'))
                             output += chunk
                             buffer += chunk
                             got_data = True
@@ -418,7 +454,7 @@ class ConnectionManager:
                     if channel.recv_stderr_ready():
                         chunk_bytes = channel.recv_stderr(1024)
                         if chunk_bytes:
-                            chunk = chunk_bytes.decode('utf-8', errors='replace')
+                            chunk = _clean_terminal_output(chunk_bytes.decode('utf-8', errors='replace'))
                             output += chunk
                             buffer += chunk
                             got_data = True
@@ -525,7 +561,7 @@ class ConnectionManager:
                     if conn.serial_client.in_waiting > 0:
                         idle_time = 0.0
                         try:
-                            chunk = conn.serial_client.read(conn.serial_client.in_waiting).decode('utf-8', errors='replace')
+                            chunk = _clean_terminal_output(conn.serial_client.read(conn.serial_client.in_waiting).decode('utf-8', errors='replace'))
                             output += chunk
                             buffer += chunk
                             self.on_output(chunk, session_id)

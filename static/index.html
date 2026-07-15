@@ -104,7 +104,13 @@
                 <div class="header-actions">
                     <span id="cost-badge" class="badge cost-badge" title="Token usage & estimated cost for this session">0 tokens</span>
                     <button id="export-btn" class="icon-btn" title="Export session as report" style="display:none;">⤓</button>
-                    <span id="agent-status" class="badge idle">Ready</span>
+                    <button id="cases-btn" class="icon-btn" title="Knowledge Base / Cases" style="display:none;">📚</button>
+                    <label class="safe-mode-toggle" title="Safe Mode: agent suggests commands instead of executing them">
+                    <input type="checkbox" id="safe-mode-checkbox">
+                    <span class="safe-mode-slider"></span>
+                    <span class="safe-mode-label">Safe</span>
+                </label>
+                <span id="agent-status" class="badge idle">Ready</span>
                 </div>
             </header>
             
@@ -156,6 +162,17 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    
+    <!-- Cases / Knowledge Base Modal -->
+    <div id="cases-modal" class="modal-overlay">
+        <div class="modal glass-panel" style="max-width: 700px; max-height: 80vh; overflow-y: auto;">
+            <h3>Knowledge Base</h3>
+            <button id="generate-all-cases-btn" class="btn primary-btn" style="margin-bottom: 1rem; width: auto;">Generate Cases from All Sessions</button>
+            <div id="cases-list" class="cases-list"></div>
+            <button class="btn secondary-btn" id="cases-close-btn" style="margin-top: 1rem;">Close</button>
+        </div>
+    </div>
+
+<script src="/static/app.js"></script>
 </body>
 </html>

@@ -30,6 +30,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const costBadge = document.getElementById('cost-badge');
     const exportBtn = document.getElementById('export-btn');
+    const safeModeCheckbox = document.getElementById('safe-mode-checkbox');
+
+    const casesBtn = document.getElementById('cases-btn');
+    const casesModal = document.getElementById('cases-modal');
+    const casesList = document.getElementById('cases-list');
+    const generateAllCasesBtn = document.getElementById('generate-all-cases-btn');
+    const casesCloseBtn = document.getElementById('cases-close-btn');
 
     const fileInput = document.getElementById('file-input');
     const uploadBtn = document.getElementById('upload-btn');
@@ -159,9 +166,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Cost badge + export button
                 updateCostBadge(data.session.usage);
                 exportBtn.style.display = 'inline-flex';
+                casesBtn.style.display = 'inline-flex';
 
                 // Device profile memory card (if a profile exists for this device)
                 renderDeviceProfile(data.session.device_profile);
+
+                // Restore safe mode toggle state for this session.
+                restoreSafeMode(sessionId);
 
                 // Pre-fill connection params
                 const params = data.session.connection_params || {};
@@ -541,6 +552,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // --- Safe mode toggle ---
+    safeModeCheckbox.addEventListener('change', async () => {
+        if (!activeSessionId) return;
+        try {
+            await fetch('/api/safe-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: activeSessionId, enabled: safeModeCheckbox.checked })
+            });
+        } catch (e) { console.error('Safe mode toggle failed:', e); }
+    });
+
+    async function restoreSafeMode(sid) {
+        try {
+            const res = await fetch(`/api/safe-mode?session_id=${sid}`, { cache: 'no-store' });
+            const data = await res.json();
+            safeModeCheckbox.checked = !!data.safe_mode;
+        } catch (e) { /* default off */ }
+    }
+
     // --- File upload ---
     // Ask for notification permission once on first connect so background-done
     // alerts can fire even when this tab is not focused.
@@ -635,6 +666,28 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         else if (data.type === 'agent_message') {
             appendMessage(data.content, 'msg-agent');
+            currentTerminalBlock = null;
+        }
+        else if (data.type === 'reasoning') {
+            // Collapsible reasoning/thinking trace (like DeepSeek's UI).
+            const wrapper = document.createElement('div');
+            wrapper.className = 'reasoning-block msg';
+            const header = document.createElement('div');
+            header.className = 'reasoning-header';
+            header.innerHTML = '<span class="reasoning-toggle">&#9654;</span> Thought process';
+            const body = document.createElement('div');
+            body.className = 'reasoning-body';
+            body.textContent = data.content;
+            body.style.display = 'none';
+            header.addEventListener('click', () => {
+                const open = body.style.display !== 'none';
+                body.style.display = open ? 'none' : 'block';
+                header.querySelector('.reasoning-toggle').textContent = open ? '\u25B6' : '\u25BC';
+            });
+            wrapper.appendChild(header);
+            wrapper.appendChild(body);
+            messageFeed.appendChild(wrapper);
+            scrollToBottom();
             currentTerminalBlock = null;
         }
         else if (data.type === 'tool_call') {
@@ -870,6 +923,68 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function scrollToBottom() {
         messageFeed.scrollTop = messageFeed.scrollHeight;
+    }
+
+
+    // --- Knowledge base / cases ---
+    casesBtn.addEventListener('click', async () => {
+        casesModal.classList.add('active');
+        await loadCases();
+    });
+    casesCloseBtn.addEventListener('click', () => casesModal.classList.remove('active'));
+
+    generateAllCasesBtn.addEventListener('click', async () => {
+        generateAllCasesBtn.textContent = 'Generating...';
+        generateAllCasesBtn.disabled = true;
+        try {
+            const res = await fetch('/api/cases/generate?all_sessions=true', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'success') {
+                generateAllCasesBtn.textContent = 'Generated ' + data.generated + ' case(s)';
+                await loadCases();
+                setTimeout(() => { generateAllCasesBtn.textContent = 'Generate Cases from All Sessions'; generateAllCasesBtn.disabled = false; }, 3000);
+            }
+        } catch (e) { console.error('Case generation failed:', e); generateAllCasesBtn.disabled = false; generateAllCasesBtn.textContent = 'Generate Cases from All Sessions'; }
+    });
+
+    async function loadCases() {
+        try {
+            const res = await fetch('/api/cases', { cache: 'no-store' });
+            const data = await res.json();
+            if (data.status === 'success') renderCases(data.by_domain, data.total);
+        } catch (e) { console.error('Load cases failed:', e); }
+    }
+
+    function renderCases(byDomain, total) {
+        casesList.innerHTML = '';
+        if (total === 0) {
+            casesList.innerHTML = '<p style="color:var(--text-secondary);">No cases yet. Run some debugging sessions, then click Generate.</p>';
+            return;
+        }
+        const domains = Object.keys(byDomain).sort();
+        for (const domain of domains) {
+            const group = document.createElement('div');
+            group.style.marginBottom = '1rem';
+            const header = document.createElement('div');
+            header.style.cssText = 'font-weight:600;color:var(--primary-color);font-size:0.85rem;margin-bottom:0.3rem;text-transform:capitalize;';
+            header.textContent = domain.replace(/-/g, ' ') + ' (' + byDomain[domain].length + ')';
+            group.appendChild(header);
+            for (const c of byDomain[domain]) {
+                const item = document.createElement('div');
+                item.className = 'session-item';
+                item.style.cssText = 'cursor:pointer;';
+                const name = document.createElement('div');
+                name.className = 'session-name';
+                name.textContent = c.title;
+                name.style.fontSize = '0.82rem';
+                item.appendChild(name);
+               item.addEventListener('click', () => {
+                   window.open('/api/cases/' + c.domain + '/' + c.filename, '_blank');
+               });
+                group.appendChild(item);
+            }
+            casesList.appendChild(group);
+        }
     }
 
     async function refreshUsage() {

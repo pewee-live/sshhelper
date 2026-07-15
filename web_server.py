@@ -34,6 +34,8 @@ from vault import VAULT
 import audit
 from device_groups import GROUP_MANAGER
 from baseline import BASELINE_MANAGER
+import case_generator
+from external_api import router as external_router
 
 
 def clean_message_history(messages):
@@ -122,6 +124,10 @@ def _connection_params_for_session(session_id):
 
 
 app = FastAPI()
+
+# Mount external tool API (for AI agents) under /api/v1, cleanly separated
+# from the existing /api/* human-interaction endpoints.
+app.include_router(external_router, prefix="/api/v1")
 
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
@@ -226,6 +232,7 @@ active_agent_tasks = {}     # session_id -> asyncio.Task (running or finished)
 session_viewers = {}        # session_id -> WebSocket currently attached (or None)
 session_events = {}         # session_id -> list[dict] live event buffer for replay
 active_session_id = None    # last-viewed session, used only as a fallback
+session_safe_mode = {}      # session_id -> bool (user-toggled safe mode)
 
 # Cross-thread human-input plumbing (tool threads block on these).
 password_events = {}        # session_id -> threading.Event
@@ -572,6 +579,72 @@ async def health():
     """Liveness/readiness probe for container orchestrators & reverse proxies."""
     return {"status": "ok", "agent_ready": agent_app is not None}
 
+
+class SafeModeRequest(BaseModel):
+    session_id: Optional[str] = None
+    enabled: bool
+
+
+@app.post("/api/safe-mode")
+async def toggle_safe_mode(req: SafeModeRequest):
+    """Toggle safe mode for a session. When enabled, the agent will NOT execute
+    any system-modifying commands -- it will only suggest them with explanations."""
+    sid = req.session_id or active_session_id
+    if not sid:
+        return {"status": "error", "message": "No session specified."}
+    session_safe_mode[sid] = bool(req.enabled)
+    return {"status": "success", "session_id": sid, "safe_mode": session_safe_mode[sid]}
+
+
+@app.get("/api/safe-mode")
+async def get_safe_mode(session_id: Optional[str] = None):
+    sid = session_id or active_session_id
+    return {"safe_mode": session_safe_mode.get(sid, False) if sid else False}
+
+# --- Case generation & knowledge base ---
+
+@app.post("/api/cases/generate")
+async def generate_cases(session_id: Optional[str] = None, all_sessions: bool = False):
+    """Manually trigger case generation from one session or all sessions."""
+    if all_sessions:
+        count = await case_generator.generate_from_all_sessions(SESSION_MANAGER)
+        return {"status": "success", "generated": count}
+    sid = session_id or active_session_id
+    if not sid:
+        return {"status": "error", "message": "No session specified."}
+    data = SESSION_MANAGER.load_session(sid)
+    if not data:
+        return {"status": "error", "message": "Session not found."}
+    try:
+        messages = clean_message_history(messages_from_dict(data.get("messages", [])))
+    except Exception:
+        messages = messages_from_dict(data.get("messages", []))
+    count = await case_generator.generate_from_session(sid, data, messages)
+    return {"status": "success", "generated": count}
+
+
+@app.get("/api/cases")
+async def list_cases_endpoint():
+    """List all generated cases grouped by domain."""
+    cases = case_generator.list_cases()
+    by_domain = {}
+    for c in cases:
+        by_domain.setdefault(c["domain"], []).append(c)
+    return {"status": "success", "cases": cases, "by_domain": by_domain, "total": len(cases)}
+
+
+@app.get("/api/cases/{domain}/{filename}")
+async def get_case(domain: str, filename: str):
+    """Read a single case's full Markdown content."""
+    safe_domain = os.path.basename(domain)
+    safe_fn = os.path.basename(filename)
+    path = os.path.join("data", "cases", safe_domain, safe_fn)
+    if not os.path.exists(path):
+        return {"status": "error", "message": "Case not found"}
+    with open(path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content, media_type="text/markdown")
 
 @app.post("/api/connect")
 async def connect(req: ConnectRequest):
@@ -1049,7 +1122,25 @@ def _persist_session(session_id, messages):
             session_data["messages"] = messages_to_dict(messages)
             SESSION_MANAGER.save_session(session_id, session_data)
     except Exception as e:
-        print(f"Failed to persist session {session_id}: {e}")
+       print(f"Failed to persist session {session_id}: {e}")
+
+
+def _trigger_case_generation(session_id: str, messages: list):
+    """Fire-and-forget: extract reusable cases from a just-finished session.
+    Runs as a background asyncio task so the user never waits for it."""
+    async def _do_generate():
+        try:
+            data = SESSION_MANAGER.load_session(session_id)
+            if not data:
+                return
+            count = await case_generator.generate_from_session(session_id, data, messages)
+            if count > 0:
+                print(f"[cases] generated {count} case(s) from session {session_id}")
+                await broadcast(session_id, {"type": "case_generated", "count": count})
+        except Exception as e:
+            print(f"[cases] auto-generation failed for {session_id}: {e}")
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(_do_generate(), main_loop)
 
 
 async def run_agent_workflow(session_id: str, messages: list):
@@ -1064,6 +1155,7 @@ async def run_agent_workflow(session_id: str, messages: list):
                 "session_id": session_id,
                 "device_profile": device_profile,
                 "connection_params": _connection_params_for_session(session_id),
+                "safe_mode": session_safe_mode.get(session_id, False),
             },
         }
         await broadcast(session_id, {"type": "status", "content": "Thinking..."})
@@ -1080,9 +1172,17 @@ async def run_agent_workflow(session_id: str, messages: list):
                             await broadcast(session_id, {"type": "tool_call", "name": tc["name"], "args": tc["args"]})
                     else:
                         await broadcast(session_id, {"type": "agent_message", "content": msg.content})
-                elif node_name in ("tools", "invalid_tools"):
+                    # Stream the model reasoning/thinking trace if present.
+                    reasoning = ""
+                    try:
+                        ak = getattr(msg, "additional_kwargs", {}) or {}
+                        reasoning = ak.get("reasoning_content") or ak.get("reasoning") or ""
+                    except Exception:
+                        pass
+                    if reasoning:
+                        await broadcast(session_id, {"type": "reasoning", "content": reasoning})
+                elif node_name in ["tools", "invalid_tools"]:
                     await broadcast(session_id, {"type": "status", "content": "Thinking..."})
-
                 new_msgs = node_state["messages"]
                 if isinstance(new_msgs, list):
                     messages.extend(new_msgs)
@@ -1105,6 +1205,9 @@ async def run_agent_workflow(session_id: str, messages: list):
         await broadcast(session_id, {"type": "run_done", "session_id": session_id})
         # History is now durably saved; clear the live replay buffer.
         session_events.setdefault(session_id, []).clear()
+        # Auto-generate reusable cases from this session in the background.
+        # Fire-and-forget: the user should never wait for case extraction.
+        _trigger_case_generation(session_id, messages)
     except asyncio.CancelledError:
         try:
             await broadcast(session_id, {"type": "status", "content": "Ready"})

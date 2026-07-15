@@ -379,6 +379,46 @@ input:disabled {
 .device-profile-card b {
     color: var(--primary-color);
 }
+.reasoning-block {
+    align-self: flex-start;
+    width: 100%;
+    max-width: 85%;
+    margin-bottom: 0.25rem;
+}
+.reasoning-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    transition: background 0.2s ease;
+}
+.reasoning-header:hover {
+    background: rgba(255,255,255,0.05);
+    color: var(--text-primary);
+}
+.reasoning-toggle {
+    font-size: 0.6rem;
+    transition: transform 0.2s ease;
+}
+.reasoning-body {
+    background: rgba(0,0,0,0.25);
+    border-left: 2px solid rgba(139,148,158,0.3);
+    padding: 0.75rem 1rem;
+    margin-top: 0.25rem;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    max-height: 400px;
+    overflow-y: auto;
+    animation: slideIn 0.3s ease;
+}
 .upload-hint {
     margin-top: 0.5rem;
     font-size: 0.78rem;
@@ -389,6 +429,13 @@ input:disabled {
 }
 .upload-hint code {
     color: #a5d6ff;
+}
+.cases-list .session-item {
+    padding: 0.5rem;
+    margin-bottom: 0.3rem;
+}
+.cases-list .session-item:hover {
+    background: rgba(59,130,246,0.1);
 }
 .badge.thinking { 
     background: rgba(59, 130, 246, 0.15); 
@@ -682,5 +729,46 @@ code {
     font-size: 0.85rem;
 }
 
-
-
+/* Safe mode toggle */
+.safe-mode-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    cursor: pointer;
+    user-select: none;
+}
+.safe-mode-toggle input {
+    display: none;
+}
+.safe-mode-slider {
+    width: 32px;
+    height: 18px;
+    border-radius: 9px;
+    background: rgba(139,148,158,0.3);
+    position: relative;
+    transition: background 0.25s ease;
+}
+.safe-mode-slider::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 0.25s ease;
+}
+.safe-mode-toggle input:checked + .safe-mode-slider {
+    background: var(--success-color);
+}
+.safe-mode-toggle input:checked + .safe-mode-slider::after {
+    transform: translateX(14px);
+}
+.safe-mode-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    transition: color 0.25s ease;
+}
+.safe-mode-toggle input:checked ~ .safe-mode-label {
+    color: var(--success-color);
+}

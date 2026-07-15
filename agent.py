@@ -46,6 +46,28 @@ Remember to think step-by-step. Don't run risky commands (like rm -rf) without u
 """
 
 
+SAFE_MODE_DIRECTIVE = """
+IMPORTANT - SAFE MODE IS ACTIVE. Under safe mode, you are STRICTLY FORBIDDEN from
+executing any command that modifies the system state. This includes but is not
+limited to: installing/removing software (pip, apt, snap, npm), modifying config
+files (sed -i, echo >, tee), changing permissions (chmod, chown), starting/stopping
+services (systemctl start/stop/restart), network changes (ip, iptables, route),
+rebooting, or any file writes.
+
+Instead, when a fix requires a state-changing command, you MUST:
+1. Explain WHAT needs to change and WHY -- the root cause and the reasoning.
+2. Provide the EXACT command(s) the user should run themselves.
+3. Explain what EACH command does and its potential side effects / risks.
+4. You MAY still run read-only diagnostic commands (cat, ls, dmesg, ps, systemctl status,
+   ip addr, df, free, uname, grep) to investigate and verify. Read-only is always allowed.
+5. After the user runs your suggested command, they will tell you the result and you
+   can continue diagnosing.
+
+Summary: investigate freely (read-only), but for anything that changes the system,
+hand the commands to the user with a clear explanation instead of executing them.
+"""
+
+
 def build_hardware_agent():
     llm = get_llm()
     # Bind the execute function to the LLM
@@ -66,7 +88,12 @@ def build_hardware_agent():
         # enriched with the connected device's persisted profile.
         configurable = (config or {}).get("configurable", {})
         device_profile = configurable.get("device_profile", "") or ""
-        sys_content = SYSTEM_PROMPT + ("\n\n" + device_profile if device_profile else "")
+        safe_mode = configurable.get("safe_mode", False)
+        sys_content = SYSTEM_PROMPT
+        if safe_mode:
+            sys_content += SAFE_MODE_DIRECTIVE
+        if device_profile:
+            sys_content += "\n\n" + device_profile
         messages = [m for m in messages if not isinstance(m, SystemMessage)]
         messages = [SystemMessage(content=sys_content)] + messages
 
