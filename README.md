@@ -35,6 +35,10 @@
 24. **工业协议支持**：新增四条「无 shell 设备」的诊断通道——**SNMP**（交换机/路由器/PDU/UPS）、**Modbus**（PLC/传感器/电能表）、**Redfish**（现代服务器 BMC 带外管理）、**IPMI**（传统服务器 BMC）。Agent 会自动判断设备类型选择合适的协议工具，查询电源状态、传感器读数、接口流量、系统事件日志等，无需 SSH/串口。
 25. **多设备批量编排**：支持定义设备组（device groups），对一组设备并发执行同一命令（`batch_run`），内置滚动分批与失败熔断保护——当一波设备失败率超阈值时自动中止后续，防止错误变更扩散。凭据自动从加密保险库解析。适用于「这 50 台机器都要升级内核」「这批交换机都要改 VLAN」等 fleet 级运维场景。
 26. **配置漂移检测**：支持对设备的配置做时间点快照（`snapshot_config`），自动抓取 ip addr、iptables、路由、挂载、运行服务、SSH 配置等 11 项关键配置。之后用 `diff_config` 对比任意两次快照，精确显示哪些配置项发生了增删变化。排障「网络突然不通了」时，agent 能立刻定位是 iptables 策略变了还是 IP 被改了——把设备画像从「静态身份」升级成了「动态基线」。
+27. **安全模式**：用户可在界面上一键切换安全模式。开启后，Agent 对任何修改系统状态的操作（安装软件、改配置、重启服务等）只提供命令建议和详细说明（做什么、为什么、风险），而不亲自执行——只读诊断不受限制。适合新手学习或谨慎操作场景。
+28. **思考过程展示**：Agent 使用推理模型（如 GLM-5.2、DeepSeek-R1）时，思考过程（reasoning_content）会以可折叠面板展示，类似 DeepSeek 官方页面的体验。模型不支持时自动隐藏。
+29. **自动案例生成 / 知识库**：每次 Agent 完成一个闭环调试会话后，后台自动从会话历史中提取结构化案例（症状 → 错误信息 → 前置条件 → 诊断 → 根因 → 解决方案 → 验证 → 回滚 → 风险 → Q&A），按领域分类存档为 Markdown 文件。每个案例包含 YAML frontmatter（tags + search_queries），为后续的向量检索和案例复用提供数据基础。
+30. **外部 Agent API (OpenAPI)**：将全部 14 个设备操作能力以标准 RESTful API 暴露在 `/api/v1/tools/` 下，自动生成 OpenAPI 3.0 文档。外部 AI Agent（Dify、Coze、LangChain 等）导入 spec 后即可零代码调用 SSH、SNMP、Modbus、Redfish、IPMI、文件传输、重启重连、批量编排等全部能力——系统从「AI 助手」升级为「设备操作平台」。
 
 ---
 
@@ -62,12 +66,20 @@ stateDiagram-v2
 
 ```
 ssh-helper/
-├── agent.py           # 定义 LangGraph 状态图与 Agent 节点、工具节点的路由逻辑
-├── llm.py             # 配置与初始化 DeepSeek 大模型
-├── tools.py           # 定义硬件命令执行框架与 PTY 死锁拦截防火墙
-├── web_server.py      # 【推荐】Web 服务端入口，提供网页端全双工实时流式交互
+├── agent.py           # LangGraph 状态图：Agent 节点、工具路由、安全模式指令
+├── llm.py             # LLM 初始化（兼容 OpenAI/GDeepSeek/GLM，捕获 reasoning_content）
+├── tools.py           # 14 个 Agent 工具：命令执行、文件传输、工业协议、批量编排、漂移检测
+├── industrial.py      # 工业协议客户端：SNMP（纯 socket）/ Modbus / Redfish / IPMI
+├── device_groups.py   # 设备组管理（批量编排的设备列表持久化）
+├── baseline.py        # 配置基线快照与漂移对比
+├── vault.py           # 凭据保险库（AES-GCM 加密存储）
+├── audit.py           # 不可篡改审计日志（append-only JSONL）
+├── case_generator.py  # 自动案例生成（从会话历史提取结构化知识库案例）
+├── external_api.py    # 外部 Agent RESTful API（/api/v1/tools/，自动生成 OpenAPI 文档）
+├── web_server.py      # 【推荐】Web 服务端入口，WebSocket 人机交互 + REST API 挂载
 ├── static/            # 前端 Web UI 资源 (index.html, style.css, app.js)
 ├── main.py            # 【旧版】CLI 纯命令行终端交互入口
+├── data/              # 运行时数据（会话/设备画像/保险库/审计/基线/案例，已 gitignore）
 ├── requirements.txt   # Python 依赖清单
 ├── .env.example       # 环境变量配置模板
 └── README.md          # 帮助文档
@@ -159,7 +171,59 @@ docker run -d --name ssh-helper \
 
 ---
 
+## 外部 Agent API
+
+本系统不仅是一个人机交互的调试助手，还通过标准 RESTful API 将全部设备操作能力开放给外部 AI Agent 使用。
+
+### 快速接入
+
+1. **获取 OpenAPI 文档**：启动服务后访问 `http://localhost:8000/docs` 查看交互式 Swagger UI，或访问 `http://localhost:8000/openapi.json` 获取 OpenAPI 3.0 spec。
+2. **导入到 Agent 平台**：将 OpenAPI spec 导入 Dify、Coze、LangChain 等平台，即可自动生成可调用的工具。
+3. **直接调用**：任何能发 HTTP 请求的程序都可以直接调用 `/api/v1/tools/*` 端点。
+
+### 可用端点
+
+| 端点 | 功能 |
+|------|------|
+| `POST /api/v1/tools/execute` | SSH 执行 shell 命令 |
+| `POST /api/v1/tools/snmp` | SNMP 查询网络设备 |
+| `POST /api/v1/tools/modbus` | Modbus 读写 PLC / 传感器 |
+| `POST /api/v1/tools/redfish` | Redfish 查询服务器 BMC |
+| `POST /api/v1/tools/ipmi` | IPMI 查询传统服务器 BMC |
+| `POST /api/v1/tools/upload` | SFTP 上传文件到设备 |
+| `POST /api/v1/tools/download` | SFTP 从设备下载文件 |
+| `POST /api/v1/tools/reboot` | 重启设备并自动重连 |
+| `POST /api/v1/tools/batch-run` | 批量操作设备组（滚动 + 熔断） |
+| `POST /api/v1/tools/snapshot` | 抓取配置基线快照 |
+| `POST /api/v1/tools/diff` | 对比配置漂移 |
+| `POST /api/v1/tools/search?q=` | 搜索知识库案例 |
+| `GET /api/v1/tools/cases` | 列出全部案例 |
+| `GET /api/v1/tools/devices/{key}/profile` | 查设备画像 |
+
+凭据管理：如果不传 `password` 参数，API 会自动从加密保险库解析设备凭据。使用前先通过 `POST /api/vault/devices` 存入设备凭据。
+
+### 调用示例
+
+```bash
+# 执行命令
+curl -X POST http://localhost:8000/api/v1/tools/execute \
+  -H "Content-Type: application/json" \
+  -d '{"host": "192.168.1.10", "command": "uname -a"}'
+
+# 查询 SNMP
+curl -X POST http://localhost:8000/api/v1/tools/snmp \
+  -H "Content-Type: application/json" \
+  -d '{"host": "192.168.1.1", "oid_or_name": "sysDescr"}'
+
+# 搜索知识库
+curl -X POST "http://localhost:8000/api/v1/tools/search?q=ping%E4%B8%8D%E9%80%9A"
+```
+
+---
+
 ## 扩展与自定义
 
 - **增加工具**：如果你想赋予它更多的能力（如上传文件、特定脚本执行），只需在 `tools.py` 添加使用 `@tool` 装饰器的函数，并更新 `agent.py` 中的 `tools` 列表配置。
 - **修改 Agent 行为**：修改 `agent.py` 中的 `SYSTEM_PROMPT`，你可以针对特定的开发板告诉它预先需要知道的特定指令。
+- **增加外部 API 端点**：在 `external_api.py` 中添加新的路由即可扩展 `/api/v1/tools/` 下的能力，FastAPI 会自动更新 OpenAPI 文档。
+- **自定义案例模板**：修改 `case_generator.py` 中的 prompt 和 `_case_to_markdown` 可以调整知识库案例的结构和内容。
