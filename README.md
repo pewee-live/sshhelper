@@ -76,6 +76,7 @@ ssh-helper/
 ├── audit.py           # 不可篡改审计日志（append-only JSONL）
 ├── case_generator.py  # 自动案例生成（从会话历史提取结构化知识库案例）
 ├── external_api.py    # 外部 Agent RESTful API（/api/v1/tools/，自动生成 OpenAPI 文档）
+├── mcp_server.py      # MCP Server（将设备操作能力暴露为 MCP 工具，供 Claude/Cursor 等 AI 调用）
 ├── web_server.py      # 【推荐】Web 服务端入口，WebSocket 人机交互 + REST API 挂载
 ├── static/            # 前端 Web UI 资源 (index.html, style.css, app.js)
 ├── main.py            # 【旧版】CLI 纯命令行终端交互入口
@@ -218,6 +219,50 @@ curl -X POST http://localhost:8000/api/v1/tools/snmp \
 # 搜索知识库
 curl -X POST "http://localhost:8000/api/v1/tools/search?q=ping%E4%B8%8D%E9%80%9A"
 ```
+
+---
+
+## MCP Server（AI Agent 原生接入）
+
+除了 RESTful API，本项目还提供了标准的 [Model Context Protocol](https://modelcontextprotocol.io/) Server，让 Claude Desktop、Cursor、Cline 等 MCP 兼容的 AI Agent 即插即用地调用全部 14 个设备操作工具——不需要解析 API 文档，Agent 自己就能发现和调用。
+
+### 快速启动
+
+```bash
+# stdio 模式（默认，适用于 Claude Desktop / Cursor 等本地客户端）
+python mcp_server.py
+
+# HTTP 模式（适用于远程 Agent 或 Web 端集成）
+python mcp_server.py --http
+```
+
+### 在 Claude Desktop 中使用
+
+编辑 Claude Desktop 的 `claude_desktop_config.json`：
+
+```json
+{
+  "mcpServers": {
+    "hardware-tools": {
+      "command": "python",
+      "args": ["D:\\path\\to\\mcp_server.py"],
+      "env": {
+        "OPENAI_API_KEY": "your_key",
+        "OPENAI_BASE_URL": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "OPENAI_MODEL": "glm-5.2"
+      }
+    }
+  }
+}
+```
+
+重启 Claude Desktop 后，你可以在对话中直接说「查一下 192.168.1.1 的 SNMP 信息」或「把这台设备的配置做一次快照」，Claude 会自动发现并调用对应的 MCP 工具。
+
+### 可用工具
+
+MCP Server 暴露的 14 个工具与 RESTful API 完全对等：
+
+`execute_command` · `snmp_query` · `modbus_query` · `redfish_query` · `ipmi_query` · `upload_file` · `download_file` · `reboot_device` · `batch_run` · `list_device_groups` · `snapshot_config` · `diff_config` · `search_kb` · `get_device_profile`
 
 ---
 

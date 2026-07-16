@@ -60,3 +60,6 @@ Thumbs.db
 # device groups) -- contains sensitive credentials and user-specific state.
 data/*
 !data/.gitkeep
+
+# Test cache
+.pytest_cache/

@@ -10,5 +10,6 @@ pymodbus
 pyghmi
 fastapi
 python-multipart
+fastmcp
 uvicorn
 websockets

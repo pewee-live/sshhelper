@@ -89,43 +89,77 @@ class CredentialVault:
         return self._aesgcm.decrypt(nonce, ct, None).decode("utf-8")
 
     def store(self, device_key: str, conn_type: str, params: dict, secret: Optional[str] = None) -> dict:
-        """Persist a credential entry. `secret` (e.g. SSH password) is encrypted;
-        non-secret params (host/username/port) are stored in the clear so the UI
-        can show connection metadata without needing to decrypt."""
+        """Persist a credential entry. `secret` (e.g. SSH password) is AES-GCM
+        encrypted before storage. Uses SQLite for atomic, concurrent-safe writes."""
         if not device_key:
             return None
-        entry = {
-            "device_key": device_key,
-            "conn_type": conn_type,
-            "params": params,
-            "secret_enc": self._encrypt(secret) if secret else None,
-            "has_secret": bool(secret),
-            "updated_at": datetime.now().isoformat(),
+        secret_enc = self._encrypt(secret) if secret else None
+        try:
+            from db import db
+            db.store_credential(device_key, conn_type, params, secret_enc)
+        except Exception:
+            # Fallback to legacy JSON storage.
+            entry = {
+                "device_key": device_key, "conn_type": conn_type,
+                "params": params, "secret_enc": secret_enc,
+                "has_secret": bool(secret), "updated_at": datetime.now().isoformat(),
+            }
+            self._entries[device_key] = entry
+            self._save()
+        return {
+            "device_key": device_key, "conn_type": conn_type, "params": params,
+            "has_secret": bool(secret), "updated_at": datetime.now().isoformat(),
         }
-        self._entries[device_key] = entry
-        self._save()
-        # Return a sanitized copy (no ciphertext).
-        return self._sanitize(entry)
 
     def resolve(self, device_key: str) -> Optional[str]:
         """Return the decrypted secret for a device, or None."""
-        entry = self._entries.get(device_key)
-        if not entry or not entry.get("secret_enc"):
+        secret_enc = None
+        try:
+            from db import db
+            row = db.get_credential(device_key)
+            if row:
+                secret_enc = row.get("secret_enc")
+        except Exception:
+            pass
+        if not secret_enc:
+            entry = self._entries.get(device_key, {})
+            secret_enc = entry.get("secret_enc")
+        if not secret_enc:
             return None
         try:
-            return self._decrypt(entry["secret_enc"])
+            return self._decrypt(secret_enc)
         except Exception as e:
             print(f"[vault] decrypt failed for {device_key}: {e}")
             return None
 
     def get(self, device_key: str) -> Optional[dict]:
+        try:
+            from db import db
+            row = db.get_credential(device_key)
+            if row:
+                return self._sanitize(row)
+        except Exception:
+            pass
         entry = self._entries.get(device_key)
         return self._sanitize(entry) if entry else None
 
     def list(self):
+        try:
+            from db import db
+            rows = db.list_credentials()
+            if rows:
+                return rows
+        except Exception:
+            pass
         return [self._sanitize(e) for e in self._entries.values()]
 
     def delete(self, device_key: str) -> bool:
+        try:
+            from db import db
+            if db.delete_credential(device_key):
+                return True
+        except Exception:
+            pass
         if device_key in self._entries:
             del self._entries[device_key]
             self._save()

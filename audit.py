@@ -1,18 +1,19 @@
 """Append-only audit log for all device commands.
 
-Every command executed against a device is recorded here as one JSONL line with:
-session_id, device target, command, exit_status, source, and timestamp.
+Uses SQLite (via db.py) for atomic, concurrent-safe writes with indexed
+querying. Falls back to the legacy JSONL file for backward compatibility
+if the database is unavailable.
 
-The log is append-only by design (we never rewrite or delete lines). It powers
-the /api/audit endpoint so operators can answer "who ran what against which
-device, and what happened" -- a baseline requirement for any production-grade
-remote-execution tool.
+Every command executed against a device is recorded with: session_id, device,
+command, exit_status, source, and timestamp. This powers the /api/audit
+endpoint so operators can answer "who ran what against which device."
 """
 import os
 import json
 from datetime import datetime
 from typing import Optional
 
+# Legacy JSONL path (used as fallback / for migration)
 AUDIT_DIR = "data/audit"
 AUDIT_FILE = os.path.join(AUDIT_DIR, "audit.jsonl")
 
@@ -26,6 +27,15 @@ def record(
     detail: Optional[str] = None,
 ):
     """Append one audit record. Never raises -- auditing must not break runs."""
+    try:
+        from db import db
+        db.record_audit(session_id, device, command, exit_status, source, detail)
+    except Exception:
+        # Fallback to legacy JSONL if SQLite is unavailable.
+        _record_jsonl(session_id, device, command, exit_status, source, detail)
+
+
+def _record_jsonl(session_id, device, command, exit_status, source, detail):
     try:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         rec = {
@@ -51,6 +61,14 @@ def query(
     source: Optional[str] = None,
 ):
     """Return recent audit records, newest first, optionally filtered."""
+    try:
+        from db import db
+        return db.query_audit(session_id, device, limit, source)
+    except Exception:
+        return _query_jsonl(session_id, device, limit, source)
+
+
+def _query_jsonl(session_id, device, limit, source):
     if not os.path.exists(AUDIT_FILE):
         return []
     out = []

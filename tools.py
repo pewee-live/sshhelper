@@ -2,6 +2,7 @@ import time
 import paramiko
 import serial
 import re
+import threading
 from typing import Optional
 from getpass import getpass
 import os
@@ -46,6 +47,63 @@ def _clean_terminal_output(text: str) -> str:
 
 
 import audit
+
+
+# --- Safe mode command classification -----------------------------------------
+# Used to intercept state-changing commands when safe mode is active, so the
+# constraint is enforced at the tool layer (guaranteed) rather than only in the
+# system prompt (best-effort).
+
+# Commands/patterns that MODIFY system state -- blocked under safe mode.
+_MODIFY_PATTERNS = [
+    r"\b(apt|apt-get|dpkg|snap|pip|pip3|npm|yarn|gem|cargo|go install)\b.*\b(install|remove|purge|upgrade|autoremove)\b",
+    r"\b(systemctl|service|rc-update|init\.d)\b.*\b(start|stop|restart|reload|enable|disable)\b",
+    r"\b(echo|printf|cat|tee)\b.*>",
+    r"\bsed\b.*-i",
+    r"\b(dd|mkfs|fdisk|parted)\b",
+    r"\b(mkdir|rmdir|rm|mv|cp|install|truncate)\b",
+    r"\btouch\b",
+    r"\b(chmod|chown|chattr|setfacl)\b",
+    r"\biptables\b",
+    r"\b(ip|ifconfig)\b.*\b(add|del|set|flush|down)\b",
+    r"\bnft\b",
+    r"\bufw\b",
+    r"\biwconfig\b",
+    r"\bnmcli\b.*\b(add|modify|delete)\b",
+    r"\b(useradd|userdel|usermod|groupadd|groupdel|passwd|chpasswd|adduser|deluser)\b",
+    r"\b(reboot|shutdown|poweroff|halt|init\s+[06])\b",
+    r"\bcrontab\b",
+    r"\bat\b",
+    r"\bsystemctl\b.*\btimer\b",
+    r"\bmount\b",
+    r"\bumount\b",
+    r"\bswap(on|off)\b",
+    r"\b(modprobe|insmod|rmmod)\b",
+    r"\b(mysql|psql|sqlite3|mongod|redis-cli)\b.*\b(CREATE|DROP|ALTER|INSERT|UPDATE|DELETE|TRUNCATE)\b",
+]
+
+_MODIFY_RE = [re.compile(p, re.IGNORECASE) for p in _MODIFY_PATTERNS]
+
+
+def _classify_command(command: str) -> str:
+    """Classify a shell command as 'read' (safe) or 'modify' (state-changing).
+
+    Used by the safe-mode guard to block modifications at the tool layer."""
+    cmd = command.strip()
+    for pattern in _MODIFY_RE:
+        if pattern.search(cmd):
+            return "modify"
+    return "read"
+
+
+def _safe_mode_block_message(command: str) -> str:
+    """Return a user-friendly message when safe mode blocks a command."""
+    return (
+        f"[SAFE MODE] The command below was BLOCKED because it modifies system state.\n"
+        f"Blocked command: {command}\n\n"
+        f"Safe mode is ON. The agent will NOT execute this command. Instead, review it and run it manually if you decide it is safe.\n"
+        f"Toggle safe mode off in the UI if you want the agent to execute it directly."
+    )
 
 
 # Password / credential prompt keywords (English and Chinese).
@@ -145,6 +203,10 @@ class ConnectionManager:
         self.connections = {}
         # Default connection for CLI / backward compatibility
         self._default_connection = Connection()
+        # Per-session locks so concurrent calls targeting the same device are
+        # serialized (a device terminal can only run one command at a time).
+        self._locks: dict = {}
+        self._locks_guard = threading.Lock()
 
         # Callbacks that can be overridden by the Web server
         self.on_output = lambda text, session_id=None: print(text, end='', flush=True)
@@ -160,6 +222,14 @@ class ConnectionManager:
         if session_id not in self.connections:
             self.connections[session_id] = Connection()
         return self.connections[session_id]
+
+    def _get_lock(self, session_id: Optional[str]) -> threading.Lock:
+        """Get or create a per-session lock for serializing device operations."""
+        key = session_id or "_default"
+        with self._locks_guard:
+            if key not in self._locks:
+                self._locks[key] = threading.Lock()
+            return self._locks[key]
 
     @property
     def conn_type(self) -> Optional[str]:
@@ -290,7 +360,11 @@ class ConnectionManager:
         return False
 
     def upload_file(self, local_path: str, remote_path: str, session_id: Optional[str] = None) -> str:
-        """Upload a local file to the connected device via SFTP (SSH only)."""
+        """Upload a local file to the connected device via SFTP (SSH only), serialized per session."""
+        with self._get_lock(session_id):
+            return self._upload_file_impl(local_path, remote_path, session_id)
+
+    def _upload_file_impl(self, local_path: str, remote_path: str, session_id: Optional[str] = None) -> str:
         conn = self.get_connection(session_id)
         if conn.conn_type != "ssh" or not conn.ssh_client:
             return "Error: File upload is only supported over SSH connections. Serial connections cannot transfer files."
@@ -316,7 +390,11 @@ class ConnectionManager:
             return f"Error uploading file: {e}"
 
     def download_file(self, remote_path: str, local_path: str, session_id: Optional[str] = None) -> str:
-        """Download a file from the connected device to a local path (SSH only)."""
+        """Download a file from the connected device, serialized per session."""
+        with self._get_lock(session_id):
+            return self._download_file_impl(remote_path, local_path, session_id)
+
+    def _download_file_impl(self, remote_path: str, local_path: str, session_id: Optional[str] = None) -> str:
         conn = self.get_connection(session_id)
         if conn.conn_type != "ssh" or not conn.ssh_client:
             return "Error: File download is only supported over SSH connections. Serial connections cannot transfer files."
@@ -400,6 +478,11 @@ class ConnectionManager:
     # --- Command execution ----------------------------------------------------
 
     def execute(self, command: str, session_id: Optional[str] = None) -> str:
+        """Execute a command on the connected device, serialized per session."""
+        with self._get_lock(session_id):
+            return self._execute_impl(command, session_id)
+
+    def _execute_impl(self, command: str, session_id: Optional[str] = None) -> str:
         # --- Safety Firewall ---
         # Prevent the LLM from blindly running full-screen interactive CLI apps
         # that would trap our PTY terminal in an infinite display loop.
@@ -744,6 +827,12 @@ def execute_device_command(command: str, config: RunnableConfig) -> str:
     print(f"\n[TOOL EXECUTING COMMAND]: {command}")
     session_id = config.get("configurable", {}).get("session_id")
     try:
+        # Safe mode guard: block state-changing commands at the tool layer.
+        # The system prompt asks the agent not to run them, but this is a
+        # guaranteed backstop in case the LLM doesn't comply.
+        safe_mode = config.get("configurable", {}).get("safe_mode", False)
+        if safe_mode and _classify_command(command) == "modify":
+            return _safe_mode_block_message(command)
         return DEVICE_MANAGER.execute(command, session_id=session_id)
     except Exception as e:
         return f"Error executing command: {str(e)}"
@@ -1128,6 +1217,10 @@ def batch_run(group_id: str, command: str, batch_size: int = 10,
             devices in a wave fail (default 20). Set to 100 to disable fail-fast.
     """
     session_id = (config or {}).get("configurable", {}).get("session_id")
+    # Safe mode guard: batch operations are always state-changing.
+    safe_mode = (config or {}).get("configurable", {}).get("safe_mode", False)
+    if safe_mode:
+        return _safe_mode_block_message(f"batch_run on group {group_id}: {command}")
     group = GROUP_MANAGER.get(group_id)
     if not group:
         return f"Error: Device group '{group_id}' not found. Use list_device_groups to see available groups."
