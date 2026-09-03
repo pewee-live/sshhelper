@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 from tools import (
     DEVICE_MANAGER,
@@ -30,6 +30,7 @@ import audit
 OUTPUT_MEMORY_LIMIT = 256 * 1024
 OUTPUT_TRIM_TO = 128 * 1024
 CLOSED_STATUS_GRACE = 2.0
+SERIAL_DONE_TIMEOUT = 2.0
 
 
 class NotConnectedError(RuntimeError):
@@ -291,24 +292,203 @@ class PtyCommand:
         }
 
 
+class SerialCommand:
+    """One non-blocking command or console read on a serial port.
+
+    Serial consoles do not provide an exit status. A command is considered
+    complete after the console has stayed idle briefly; continuously printing
+    commands remain running and can be polled with get_output().
+    """
+
+    def __init__(self, serial_client, command: str, command_id: str,
+                 session_id: str = "mcp", device: str = "unknown",
+                 audit_record: Optional[Callable] = None,
+                 send_line: bool = True,
+                 idle_done: float = SERIAL_DONE_TIMEOUT):
+        self.serial = serial_client
+        self.command = command
+        self.command_id = command_id
+        self.session_id = session_id
+        self.device = device
+        self.state = "running"
+        self.hint: Optional[str] = None
+        self.exit_status: Optional[int] = None
+        self.error: Optional[str] = None
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None
+        self._output = ""
+        self._terminal = TerminalOutputFilter()
+        self._undelivered = 0
+        self._idle = 0.0
+        self._idle_done = max(0.1, float(idle_done))
+        self._audit_record = audit_record or audit.record
+        self._noted = False
+        self._audit_record(session_id=session_id, device=device,
+                           command=command, source="mcp")
+
+        # A read-only console capture does not disturb U-Boot or boot logs.
+        if send_line:
+            try:
+                self.serial.reset_input_buffer()
+            except Exception:
+                pass
+            self.serial.write(f"{command}\r\n".encode("utf-8"))
+
+    @property
+    def output(self) -> str:
+        return self._output
+
+    def take_new_output(self) -> str:
+        new = self._output[self._undelivered:]
+        self._undelivered = len(self._output)
+        return new
+
+    def tail(self, lines: int = 80) -> str:
+        return self._terminal.tail(lines).strip()
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at or time.time()
+        return max(0.0, end - self.started_at)
+
+    def _append(self, chunk: str) -> None:
+        self._output += chunk
+        if len(self._output) > OUTPUT_MEMORY_LIMIT:
+            cut = len(self._output) - OUTPUT_TRIM_TO
+            self._output = self._output[cut:]
+            self._undelivered = max(0, self._undelivered - cut)
+
+    def _drain_once(self) -> bool:
+        got_data = False
+        try:
+            while self.serial.in_waiting:
+                chunk_bytes = self.serial.read(self.serial.in_waiting)
+                if not chunk_bytes:
+                    break
+                self._terminal.push(chunk_bytes.decode("utf-8", errors="replace"))
+                chunk = self._terminal.take_stable()
+                if chunk:
+                    self._append(chunk)
+                    got_data = True
+                self._idle = 0.0
+        except Exception as e:
+            self._fail(f"Error reading serial port: {e}")
+            return True
+        return got_data
+
+    def _finish(self, state: str = "completed") -> None:
+        remaining = self._terminal.flush()
+        if remaining:
+            self._append(remaining)
+        self.state = state
+        self.finished_at = time.time()
+        self._audit_final()
+
+    def poll(self, timeout: float = 0.0) -> str:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self._drain_once():
+                if self.is_terminal:
+                    return self.state
+                continue
+            if self.is_terminal:
+                return self.state
+
+            if self._idle >= PROMPT_DETECT_MIN_IDLE:
+                kind = _classify_prompt(self._terminal.active_line)
+                if kind:
+                    self.state = "awaiting_input"
+                    self.hint = kind
+                    return self.state
+
+            if self._idle >= self._idle_done:
+                self._finish("completed")
+                return self.state
+
+            if time.monotonic() >= deadline:
+                return self.state
+            time.sleep(0.05)
+            self._idle = round(self._idle + 0.05, 3)
+
+    def send(self, text: str, press_enter: bool = True) -> None:
+        if self.state not in ("running", "awaiting_input"):
+            raise RuntimeError(
+                f"Command {self.command_id} is not accepting input (state={self.state})."
+            )
+        payload = text + ("\r\n" if press_enter else "")
+        self.serial.write(payload.encode("utf-8"))
+        self.state = "running"
+        self.hint = None
+        self._idle = 0.0
+
+    def stop(self) -> None:
+        if self.is_terminal:
+            return
+        try:
+            self.serial.write(b"\x03")
+        except Exception:
+            pass
+        self._finish("stopped")
+
+    def complete(self) -> None:
+        """Finish a read-only capture without sending Ctrl+C to the board."""
+        if self.is_terminal:
+            return
+        self._finish("completed")
+
+    def _fail(self, message: str) -> None:
+        self.error = message
+        self._finish("failed")
+
+    def _audit_final(self) -> None:
+        if self._noted:
+            return
+        self._noted = True
+        detail = f"state={self.state}"
+        if self.error:
+            detail += f"; {self.error}"
+        self._audit_record(session_id=self.session_id, device=self.device,
+                           command=self.command, exit_status=self.exit_status,
+                           source="mcp", detail=detail)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.state in ("completed", "failed", "stopped")
+
+    def summary(self) -> dict:
+        return {
+            "command_id": self.command_id,
+            "command": self.command[:120],
+            "state": self.state,
+            "hint": self.hint,
+            "exit_status": self.exit_status,
+            "elapsed": round(self.elapsed, 1),
+        }
+
+
 @dataclass
 class ActiveConnection:
     session_id: str
-    host: str
-    port: int
-    username: str
+    conn_type: str = "ssh"
+    host: str = ""
+    port: int = 22
+    username: str = ""
+    serial_port: str = ""
+    baudrate: int = 115200
     connected_at: float = field(default_factory=time.time)
-    command: Optional[PtyCommand] = None
+    command: Optional[object] = None
     command_seq: int = 0
     history: list = field(default_factory=list)
 
     @property
     def target(self) -> str:
+        if self.conn_type == "serial":
+            return f"serial:{self.serial_port}"
         return f"ssh:{self.host}"
 
 
 class ConnectionRegistry:
-    """Holds the default (single-device) SSH session for the MCP process.
+    """Holds the default SSH or serial session for the MCP process.
 
     The MCP server process is long-lived, so the paramiko connection survives
     across tool calls. Codex only calls tools; connection state lives here.
@@ -337,10 +517,35 @@ class ConnectionRegistry:
             ))
             return self._conn
 
+    def connect_serial(self, port: str, baudrate: int = 115200) -> ActiveConnection:
+        """Establish (or replace) the default serial console connection."""
+        with self._lock:
+            safe_port = "".join(c if c.isalnum() else "-" for c in port)
+            session_id = f"mcp-serial-{safe_port}-{uuid.uuid4().hex[:8]}"
+            self._dm.connect_serial(port, baudrate, session_id=session_id)
+            conn = ActiveConnection(
+                session_id=session_id,
+                conn_type="serial",
+                host=port,
+                serial_port=port,
+                baudrate=baudrate,
+            )
+            self._replace_locked(conn)
+            audit.record(
+                session_id=session_id,
+                device=conn.target,
+                command=f"<connect serial {port}@{baudrate}>",
+                exit_status=0,
+                source="mcp",
+            )
+            return self._conn
+
     def require(self) -> ActiveConnection:
         with self._lock:
             if self._conn is None:
-                raise NotConnectedError("No active connection. Call connect(host) first.")
+                raise NotConnectedError(
+                    "No active connection. Call connect(host) or connect_serial(port) first."
+                )
             return self._conn
 
     def active(self) -> Optional[ActiveConnection]:
@@ -366,6 +571,11 @@ class ConnectionRegistry:
         """Re-establish the same session after a reboot (same session_id)."""
         with self._lock:
             conn = self.require()
+            if conn.conn_type == "serial":
+                raise ConnectionError(
+                    "Automatic serial reconnect is not supported. Use disconnect() "
+                    "then connect_serial(port, baudrate) after the device returns."
+                )
             if conn.command and not conn.command.is_terminal:
                 conn.command.stop()
             conn.command = None
@@ -384,8 +594,8 @@ class ConnectionRegistry:
 
     # --- Command lifecycle ---------------------------------------------------
 
-    def start_command(self, command: str) -> PtyCommand:
-        """Start a command on the default connection (one at a time)."""
+    def start_command(self, command: str) -> Union[PtyCommand, SerialCommand]:
+        """Start a command on the default SSH or serial connection."""
         with self._lock:
             conn = self.require()
             if conn.command and not conn.command.is_terminal:
@@ -394,17 +604,44 @@ class ConnectionRegistry:
             if firewall:
                 raise SafetyFirewallError(firewall)
             dm_conn = self._dm.get_connection(conn.session_id)
-            if dm_conn.conn_type != "ssh" or not dm_conn.ssh_client:
-                raise ConnectionError("The default connection is not an active SSH session.")
             conn.command_seq += 1
-            cmd = PtyCommand(
-                dm_conn.ssh_client, command, f"c{conn.command_seq}",
-                session_id=conn.session_id, device=conn.target,
+            if conn.conn_type == "serial":
+                if dm_conn.conn_type != "serial" or not dm_conn.serial_client:
+                    raise ConnectionError("The default connection is not an active serial session.")
+                cmd = SerialCommand(
+                    dm_conn.serial_client, command, f"c{conn.command_seq}",
+                    session_id=conn.session_id, device=conn.target,
+                )
+            else:
+                if dm_conn.conn_type != "ssh" or not dm_conn.ssh_client:
+                    raise ConnectionError("The default connection is not an active SSH session.")
+                cmd = PtyCommand(
+                    dm_conn.ssh_client, command, f"c{conn.command_seq}",
+                    session_id=conn.session_id, device=conn.target,
+                )
+            conn.command = cmd
+            return cmd
+
+    def start_console_read(self) -> SerialCommand:
+        """Capture serial output without sending a line to the console."""
+        with self._lock:
+            conn = self.require()
+            if conn.conn_type != "serial":
+                raise ConnectionError("The default connection is not a serial session.")
+            if conn.command and not conn.command.is_terminal:
+                raise CommandBusyError(conn.command)
+            dm_conn = self._dm.get_connection(conn.session_id)
+            if dm_conn.conn_type != "serial" or not dm_conn.serial_client:
+                raise ConnectionError("The serial connection is no longer active.")
+            conn.command_seq += 1
+            cmd = SerialCommand(
+                dm_conn.serial_client, "<console read>", f"c{conn.command_seq}",
+                session_id=conn.session_id, device=conn.target, send_line=False,
             )
             conn.command = cmd
             return cmd
 
-    def note_finished(self, cmd: PtyCommand) -> None:
+    def note_finished(self, cmd: Union[PtyCommand, SerialCommand]) -> None:
         """Record a terminal command into the connection history."""
         if not cmd.is_terminal:
             return
@@ -418,7 +655,7 @@ class ConnectionRegistry:
             self._recent_commands.append(cmd)
             self._recent_commands = self._recent_commands[-5:]
 
-    def find_command(self, command_id: str = "") -> Optional[PtyCommand]:
+    def find_command(self, command_id: str = "") -> Optional[Union[PtyCommand, SerialCommand]]:
         """Find a command by id (default: the active one, else the latest)."""
         with self._lock:
             candidates = []
@@ -434,21 +671,42 @@ class ConnectionRegistry:
 
     def upload(self, local_path: str, remote_path: str) -> str:
         conn = self.require()
+        if conn.conn_type == "serial":
+            return (
+                "Error: File upload is only supported over SSH connections. "
+                "Serial connections cannot transfer files."
+            )
         return self._dm.upload_file(local_path, remote_path, session_id=conn.session_id)
 
     def download(self, remote_path: str, local_path: str) -> str:
         conn = self.require()
+        if conn.conn_type == "serial":
+            return (
+                "Error: File download is only supported over SSH connections. "
+                "Serial connections cannot transfer files."
+            )
         return self._dm.download_file(remote_path, local_path, session_id=conn.session_id)
 
     def status_text(self) -> str:
         with self._lock:
             if self._conn is None:
-                return "Not connected. Call connect(host, username, port) first."
+                return (
+                    "Not connected. Call connect(host, username, port) or "
+                    "connect_serial(port, baudrate) first."
+                )
             c = self._conn
             uptime = int(time.time() - c.connected_at)
             lines = [
-                f"Connected: {c.username}@{c.host}:{c.port}",
-                f"Session: {c.session_id} (uptime {uptime}s, keepalive 15s)",
+                (
+                    f"Connected: serial {c.serial_port}@{c.baudrate}"
+                    if c.conn_type == "serial"
+                    else f"Connected: {c.username}@{c.host}:{c.port}"
+                ),
+                (
+                    f"Session: {c.session_id} (uptime {uptime}s)"
+                    if c.conn_type == "serial"
+                    else f"Session: {c.session_id} (uptime {uptime}s, keepalive 15s)"
+                ),
             ]
             if c.command is not None:
                 cmd = c.command
@@ -463,7 +721,8 @@ class ConnectionRegistry:
                 lines.append("Recent commands:")
                 for h in reversed(c.history[-5:]):
                     lines.append(
-                        f"  {h['command_id']} [{h['state']}] exit={h['exit_status']} {h['command']}"
+                        f"  {h['command_id']} [{h['state']}] "
+                        f"exit={h['exit_status']} {h['command']}"
                     )
             return "\n".join(lines)
 

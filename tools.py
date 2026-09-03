@@ -385,6 +385,8 @@ PASSWORD_PROMPT_KEYWORDS = [
     "Enter PIN",
     "Username for",
     "username for",
+    "login:",
+    "Login:",
     "Username:",
     "username:",
 ]

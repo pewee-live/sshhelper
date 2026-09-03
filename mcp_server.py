@@ -121,7 +121,7 @@ def _clip(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
 
 
 def _format_result(cmd, body: str = None) -> str:
-    """Render a PtyCommand state for the model in a compact, uniform way."""
+    """Render a command state for the model in a compact, uniform way."""
     header = f"[{cmd.command_id} {cmd.state}"
     if cmd.hint:
         header += f" hint={cmd.hint}"
@@ -143,7 +143,7 @@ def _format_result(cmd, body: str = None) -> str:
     if cmd.state == "awaiting_input":
         guidance = (
             "Ask the user for the password and call send_input(text). "
-            "The PTY will not echo it."
+            "The password should not be echoed by the device."
             if cmd.hint == "password"
             else "Ask the user how to answer, then call send_input(text) (e.g. 'y')."
         )
@@ -254,13 +254,119 @@ def connect(host: str, username: str = "root", password: str = "",
 
 
 @mcp.tool()
+def list_serial_ports() -> str:
+    """List serial ports available on the machine running this MCP server."""
+    try:
+        from serial.tools import list_ports
+        ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    except Exception as e:
+        return f"Error listing serial ports: {e}"
+    if not ports:
+        return (
+            "No serial ports found on the MCP server host. Remember that "
+            "connect_serial() can only open ports physically attached to the "
+            "server running this process."
+        )
+    lines = ["Serial ports on MCP server:"]
+    for p in ports:
+        desc = p.description or "-"
+        hwid = f" [{p.hwid}]" if p.hwid else ""
+        lines.append(f"  {p.device}: {desc}{hwid}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def connect_serial(port: str, baudrate: int = 115200,
+                   listen_seconds: float = 0.0) -> str:
+    """Connect to a serial console and keep it alive for later run() calls.
+
+    The port must exist on the machine running this MCP server, not on the
+    Codex client. After connecting, run(command) sends one console line at a
+    time; read_console() captures output without sending anything.
+
+    Args:
+        port: Serial device (Linux examples: /dev/ttyUSB0, /dev/ttyACM0;
+            Windows examples: COM3, COM4).
+        baudrate: Baud rate (default 115200).
+        listen_seconds: Optional seconds of read-only console capture. Use this
+            for boot logs or a board already sitting in U-Boot.
+
+    Returns:
+        Connection info and optionally initial console output.
+    """
+    try:
+        conn = REGISTRY.connect_serial(port, baudrate)
+    except Exception as e:
+        return f"Error connecting to serial port {port}@{baudrate}: {e}"
+
+    lines = [
+        f"Connected: serial {port}@{baudrate}",
+        f"Session: {conn.session_id} (persistent)",
+        "Note: serial commands have no exit status; completion is inferred "
+        "from console idle time.",
+    ]
+    listen_seconds = max(0.0, min(float(listen_seconds), RUN_TIMEOUT_CAP))
+    if listen_seconds:
+        try:
+            cmd = REGISTRY.start_console_read()
+            cmd.poll(listen_seconds)
+            if not cmd.is_terminal:
+                cmd.complete()
+            if cmd.is_terminal:
+                REGISTRY.note_finished(cmd)
+            output = cmd.take_new_output()
+            if output.strip():
+                lines.append(f"INITIAL CONSOLE OUTPUT:\n{_clip(output)}")
+            else:
+                lines.append("INITIAL CONSOLE OUTPUT: (none yet)")
+        except Exception as e:
+            lines.append(f"Initial console read failed: {e}")
+    lines.append("Next: run(command), read_console(), send_input(), or disconnect().")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def read_console(wait_seconds: float = 2.0) -> str:
+    """Read serial console output without sending input to the board.
+
+    Useful for boot logs, kernel panics, U-Boot countdowns, and other states
+    where writing a command could interrupt the board.
+    """
+    wait_seconds = max(0.0, min(float(wait_seconds), RUN_TIMEOUT_CAP))
+    try:
+        cmd = REGISTRY.start_console_read()
+    except CommandBusyError as e:
+        return f"Error: {e}\n{_format_result(e.active)}"
+    except Exception as e:
+        return f"Error: {e}"
+
+    cmd.poll(wait_seconds)
+    if not cmd.is_terminal:
+        cmd.complete()
+    if cmd.is_terminal:
+        REGISTRY.note_finished(cmd)
+    output = cmd.take_new_output()
+    header = f"[{cmd.command_id} {cmd.state}"
+    if cmd.hint:
+        header += f" hint={cmd.hint}"
+    header += "]"
+    if output.strip():
+        return f"{header}\nNEW OUTPUT:\n{_clip(output)}"
+    if cmd.is_terminal:
+        return f"{header}\n(no new output)"
+    return f"{header}\n(no new output yet; still watching)\nRECENT TAIL:\n{_clip(cmd.tail())}"
+
+
+@mcp.tool()
 def run(command: str, timeout: int = 30) -> str:
-    """Run a shell command on the connected device (persistent SSH session).
+    """Run a command on the connected SSH or serial device.
 
-    Connect with connect() first. Commands execute one at a time on a PTY.
+    Connect with connect() for SSH or connect_serial() for serial. Commands
+    execute one at a time. Serial completion is inferred from idle console
+    output and has no exit status.
 
-    Returns the exit status and output when the command finishes. If it is
-    still running after `timeout` seconds, returns partial output plus a
+    For SSH, returns the exit status and output when the command finishes. If
+    it is still running after `timeout` seconds, returns partial output plus a
     command_id you can poll with get_output(). If sudo or apt asks for input,
     returns state awaiting_input -- ask the user, then use send_input().
 
@@ -299,8 +405,8 @@ def send_input(text: str, press_enter: bool = True, wait_seconds: int = 10) -> s
     """Send user input to the interactive command currently waiting on the device.
 
     Use this when run() returned state 'awaiting_input' (sudo password,
-    [y/n] confirmation, menu choice...). For passwords the PTY does not echo
-    the text. Ask the human user first; do not guess secrets.
+    [y/n] confirmation, menu choice...). Ask the human user first; do not
+    guess secrets.
 
     Args:
         text: The exact input to send (password, 'y', a number, ...).
@@ -563,6 +669,12 @@ def reboot_device(wait_seconds: int = 90) -> str:
     """
     try:
         conn_info = REGISTRY.require()
+        if conn_info.conn_type == "serial":
+            return (
+                "Error: Automated reboot/reconnect is SSH-only. For serial, "
+                "issue the board's reboot command manually, then call "
+                "read_console(), then disconnect() and connect_serial()."
+            )
         dm_conn = DEVICE_MANAGER.get_connection(conn_info.session_id)
         try:
             dm_conn.ssh_client.exec_command(

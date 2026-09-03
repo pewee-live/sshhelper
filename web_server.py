@@ -3,6 +3,9 @@ import os
 import json
 import uuid
 import threading
+import atexit
+import subprocess
+import sys
 from datetime import datetime
 from typing import Optional
 
@@ -131,6 +134,66 @@ app.include_router(external_router, prefix="/api/v1")
 
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+
+# Keep the HTTP MCP transport in a separate process. Importing mcp_server here
+# would replace the DeviceManager callbacks used by this web process.
+_mcp_process = None
+
+
+def _mcp_disabled() -> bool:
+    return os.getenv("SSHELPER_START_MCP", "1").strip().lower() in {"0", "false", "no"}
+
+
+def start_mcp_server(host: str = "0.0.0.0", port: int = 8787):
+    """Start the streamable HTTP MCP server alongside the web server."""
+    global _mcp_process
+    if _mcp_disabled():
+        print("MCP server disabled by SSHELPER_START_MCP")
+        return None
+    if _mcp_process is not None and _mcp_process.poll() is None:
+        return _mcp_process
+
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    command = [
+        sys.executable,
+        os.path.join(project_root, "mcp_server.py"),
+        "--http",
+        "--host", str(host),
+        "--port", str(port),
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        _mcp_process = subprocess.Popen(
+            command,
+            cwd=project_root,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        print(f"Failed to start MCP server: {exc}")
+        return None
+
+    print(f"Starting MCP Server at http://{host}:{port}/mcp/ (pid {_mcp_process.pid})")
+    return _mcp_process
+
+
+def stop_mcp_server():
+    """Stop the MCP process started by start_mcp_server()."""
+    global _mcp_process
+    if _mcp_process is None:
+        return
+    if _mcp_process.poll() is None:
+        _mcp_process.terminate()
+        try:
+            _mcp_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _mcp_process.kill()
+            _mcp_process.wait(timeout=5)
+    _mcp_process = None
+
+
+atexit.register(stop_mcp_server)
 
 
 @app.get("/")
@@ -1152,8 +1215,26 @@ async def websocket_endpoint(ws: WebSocket, session_id: str = Query(...)):
             session_viewers[session_id] = None
 
 
-if __name__ == "__main__":
+def main():
     import uvicorn
 
-    print("Starting Web Server at http://localhost:8000/")
-    uvicorn.run("web_server:app", host="0.0.0.0", port=8000, reload=True)
+    web_host = os.getenv("WEB_HOST", "0.0.0.0")
+    web_port = int(os.getenv("WEB_PORT", "8000"))
+    mcp_host = os.getenv("MCP_HOST", web_host)
+    mcp_port = int(os.getenv("MCP_PORT", "8787"))
+
+    start_mcp_server(mcp_host, mcp_port)
+    print(f"Starting Web Server at http://localhost:{web_port}/")
+    try:
+        uvicorn.run(
+            "web_server:app",
+            host=web_host,
+            port=web_port,
+            reload=True,
+        )
+    finally:
+        stop_mcp_server()
+
+
+if __name__ == "__main__":
+    main()

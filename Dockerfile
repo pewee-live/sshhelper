@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY . .
 
-# Expose the correct FastAPI port
-EXPOSE 8000
+# Expose the web and streamable-HTTP MCP ports
+EXPOSE 8000 8787
 
 # Start the web server by default
 CMD ["python", "web_server.py"]

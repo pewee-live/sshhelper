@@ -84,6 +84,31 @@ class FakeSSHClient:
         return self.transport
 
 
+class FakeSerial:
+    def __init__(self, chunks=None):
+        self.incoming = bytearray(b"".join(chunks or []))
+        self.written = []
+
+    @property
+    def in_waiting(self):
+        return len(self.incoming)
+
+    def read(self, size):
+        data = bytes(self.incoming[:size])
+        del self.incoming[:size]
+        return data
+
+    def write(self, data):
+        self.written.append(bytes(data))
+        if data.startswith(b"version"):
+            self.incoming.extend(b"U-Boot> version\r\n")
+        elif data == b"\r\n":
+            self.incoming.extend(b"login: ")
+
+    def reset_input_buffer(self):
+        self.incoming.clear()
+
+
 class FakeDeviceManager:
     def __init__(self):
         self.connections = {}
@@ -94,12 +119,22 @@ class FakeDeviceManager:
         self.reconnect_calls = []
         self.reconnect_result = True
         self.next_channel = None
+        self.connect_serial_calls = []
+        self.next_serial = None
 
     def connect_ssh(self, host, username, password=None, port=22, session_id=None):
         self.connect_calls.append((host, username, password, port, session_id))
         channel = self.next_channel or FakeChannel()
         self.connections[session_id] = SimpleNamespace(
             conn_type="ssh", ssh_client=FakeSSHClient(channel),
+        )
+        return "connected"
+
+    def connect_serial(self, port, baudrate=115200, session_id=None):
+        self.connect_serial_calls.append((port, baudrate, session_id))
+        serial_client = self.next_serial or FakeSerial()
+        self.connections[session_id] = SimpleNamespace(
+            conn_type="serial", serial_client=serial_client,
         )
         return "connected"
 
@@ -239,6 +274,15 @@ class TestConnectionRegistry:
         assert sid == conn.session_id and sid.startswith("mcp-192.168.1.50-")
         assert dm.get_connection(sid).ssh_client.transport.keepalive == 15
 
+    def test_connect_serial_creates_session(self):
+        reg, dm = self.make_registry()
+        dm.next_serial = FakeSerial([b"U-Boot 2024.01\r\n"])
+        conn = reg.connect_serial("/dev/ttyUSB0", 1500000)
+        assert dm.connect_serial_calls == [("/dev/ttyUSB0", 1500000, conn.session_id)]
+        assert conn.session_id.startswith("mcp-serial--dev-ttyUSB0-")
+        assert conn.target == "serial:/dev/ttyUSB0"
+        assert "serial /dev/ttyUSB0@1500000" in reg.status_text()
+
     def test_connect_replaces_previous_session(self):
         reg, dm = self.make_registry()
         first = reg.connect("1.1.1.1")
@@ -280,6 +324,67 @@ class TestConnectionRegistry:
         assert reg.find_command("c2") is cmd2
         assert reg.find_command("") is cmd2
         assert reg.find_command("c1") is cmd
+
+    def test_serial_command_completes_without_exit_status(self):
+        serial = FakeSerial([b"U-Boot> version\r\n"])
+        cmd = mc.SerialCommand(
+            serial, "version", "c1", audit_record=no_audit, idle_done=0.2,
+        )
+        assert serial.written == [b"version\r\n"]
+        assert cmd.poll(1) == "completed"
+        assert cmd.exit_status is None
+        assert "U-Boot> version" in cmd.output
+
+    def test_serial_prompt_awaits_input_and_uses_crlf(self):
+        serial = FakeSerial([b"login: "])
+        cmd = mc.SerialCommand(
+            serial, "", "c1", audit_record=no_audit, idle_done=1.0,
+        )
+        assert cmd.poll(1) == "awaiting_input"
+        assert cmd.hint == "password"
+        cmd.send("root")
+        assert serial.written[-1] == b"root\r\n"
+        assert cmd.state == "running"
+
+    def test_serial_stop_sends_ctrl_c_without_closing_port(self):
+        serial = FakeSerial()
+        cmd = mc.SerialCommand(serial, "watch", "c1", audit_record=no_audit)
+        cmd.stop()
+        assert cmd.state == "stopped"
+        assert serial.written[-1] == b"\x03"
+
+    def test_serial_complete_is_read_only(self):
+        serial = FakeSerial([b"boot...\r\n"])
+        cmd = mc.SerialCommand(serial, "<console read>", "c1",
+                               audit_record=no_audit, send_line=False,
+                               idle_done=1.0)
+        assert cmd.poll(0.1) == "running"
+        cmd.complete()
+        assert cmd.state == "completed"
+        assert "boot" in cmd.output
+        assert serial.written == []
+
+    def test_serial_registry_dispatch_and_console_read(self):
+        reg, dm = self.make_registry()
+        serial = FakeSerial([b"boot log\r\n"])
+        dm.next_serial = serial
+        reg.connect_serial("COM3")
+        cmd = reg.start_command("uname -a")
+        assert isinstance(cmd, mc.SerialCommand)
+        assert serial.written == [b"uname -a\r\n"]
+        cmd.poll(3)
+        reg.note_finished(cmd)
+
+        read_cmd = reg.start_console_read()
+        assert read_cmd.command == "<console read>"
+        assert serial.written == [b"uname -a\r\n"]
+
+    def test_upload_serial_returns_clear_error(self):
+        reg, dm = self.make_registry()
+        dm.next_serial = FakeSerial()
+        reg.connect_serial("COM3")
+        result = reg.upload("local.bin", "/tmp/remote.bin")
+        assert "only supported over SSH" in result
 
     def test_upload_download_use_session(self):
         reg, dm = self.make_registry()

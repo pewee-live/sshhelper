@@ -137,7 +137,9 @@ OPENAI_API_KEY=your_actual_api_key_here
 ```bash
 python web_server.py
 ```
-终端提示启动成功后，打开浏览器访问 👉 `http://localhost:8000/`
+该入口会同时启动 Web 服务（默认 `0.0.0.0:8000`）和 streamable HTTP MCP 服务（默认 `0.0.0.0:8787/mcp`）。终端提示启动成功后，打开浏览器访问 👉 `http://localhost:8000/`
+
+如需单独调整监听地址或端口，可设置 `WEB_HOST`、`WEB_PORT`、`MCP_HOST`、`MCP_PORT`；设置 `SSHELPER_START_MCP=0` 可禁用伴生 MCP 进程。
 
 在页面左侧的侧边栏输入设备的 SSH 或 Serial 连接信息点击连接，然后在右侧输入你的硬件排错问题，例如：“网卡不见了，帮我查一下硬件层和驱动层的原因”。当碰到特权命令，页面中央会弹出输入密码的浮窗，输入即可放行指令。当命令卡在需要人工确认的交互提示（如 `conda`、`apt` 的 yes/no、`fdisk` 菜单等），会弹出干预窗口让你决定发送什么、中止还是继续等待。系统支持多会话真并发——每个会话的 Agent 任务都在后台独立运行，侧边栏会显示哪些会话正在工作，你可以放心切走去别的设备排错，随时切回来查看进度，错过的输出会自动回放。
 
@@ -156,7 +158,7 @@ python main.py
 1. **直接拉取并运行已有镜像**（请将 `<your_dockerhub_username>` 替换为实际拉取的用户名）：
 ```bash
 docker run -d --name ssh-helper \
-  -p 8000:8000 \
+  -p 8000:8000 -p 8787:8787 \
   -e OPENAI_API_KEY=your_super_secret_api_key_here \
   peweelive/sshhelper:latest
 ```
@@ -165,7 +167,7 @@ docker run -d --name ssh-helper \
 2. **如果需要使用本地串口 (Serial) 功能**：在启动时需要增加设备映射隧道 (`--device`)，以便让容器内部可以接触到底层宿主机的 USB 串口！举个例子（Linux宿主机下）：
 ```bash
 docker run -d --name ssh-helper \
-  -p 8000:8000 \
+  -p 8000:8000 -p 8787:8787 \
   -e OPENAI_API_KEY=your_key \
   --device=/dev/ttyUSB0 \
   peweelive/sshhelper:latest
@@ -235,6 +237,8 @@ curl -X POST "http://localhost:8000/api/v1/tools/search?q=ping%E4%B8%8D%E9%80%9A
 - `run()` 在 PTY 上执行命令：命令完成返回 exit status + 输出；超时返回部分输出和 `command_id`（用 `get_output()` 继续轮询，长命令不会被杀掉）；遇到 sudo 密码或 `[y/n]` 确认时返回 `awaiting_input`，问过用户后用 `send_input()` 回答（密码不会被 PTY 回显）。
 - `htop/vim/nano` 等全屏交互命令会被共享安全防火墙直接拒绝，防止 PTY 死锁；同一连接同一时刻只允许一个活动命令。
 - 所有命令照常写入 append-only 审计日志（`source=mcp`），与 Web/CLI 共用同一份追溯体系。
+- 串口同样支持持久会话：`list_serial_ports()` -> `connect_serial(port, baudrate)` -> `run(command)` / `read_console()`。串口没有 exit status，命令完成通过短暂 console 空闲推断；`read_console()` 是只读捕获，适合 boot log、kernel panic 和 U-Boot 阶段。
+- `connect_serial()` 只能打开 **运行 MCP Server 的那台机器** 上的串口。如果 USB 转串口插在 Codex 客户端本机，而 MCP 跑在远端服务器，需要在服务器上连接串口，或把 MCP 改到本机运行。
 
 ### 快速启动
 
@@ -247,6 +251,18 @@ python mcp_server.py --http --host 127.0.0.1 --port 8787
 ```
 
 建议先通过 Web UI（`http://localhost:8000`）把开发板凭据存入加密保险库，MCP 端 `connect()` 留空 `password` 即可，密码不会出现在任何模型上下文或工具参数里。
+
+串口调试示例：
+
+```text
+1. list_serial_ports()
+2. connect_serial("/dev/ttyUSB0", 115200, listen_seconds=3)
+3. read_console(5)            # 只读查看 boot log / U-Boot / panic
+4. run("version")             # 适用于 Linux shell 或 U-Boot 命令
+5. send_input("y")            # 处理确认、login、密码等交互
+``+
+
+注意：SFTP 上传/下载和自动 reboot/reconnect 仍只支持 SSH；串口只负责 console 交互。文件或固件建议通过 SSH/TFTP/fastboot 等专用链路传输。
 
 ### 在 Codex 中接入
 
@@ -280,7 +296,7 @@ startup_timeout_sec = 60
 
 ### 可用工具
 
-**持久会话（推荐工作流）**：`connect` · `run` · `send_input` · `get_output` · `stop_command` · `status` · `disconnect` · `upload_file` · `download_file` · `reboot_device` · `snapshot_config` · `list_snapshots` · `get_snapshot`
+**持久会话（推荐工作流，SSH + Serial）**：`connect` · `list_serial_ports` · `connect_serial` · `read_console` · `run` · `send_input` · `get_output` · `stop_command` · `status` · `disconnect` · `upload_file` · `download_file` · `reboot_device` · `snapshot_config` · `list_snapshots` · `get_snapshot`
 
 **无状态 / 其他能力**：`execute_command`（一次性 SSH，适合未 connect 的任意主机）· `snmp_query` · `modbus_query` · `redfish_query` · `ipmi_query` · `batch_run` · `list_device_groups` · `diff_config` · `search_kb` · `get_device_profile` · `list_device_profiles`
 

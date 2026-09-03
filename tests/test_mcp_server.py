@@ -35,6 +35,9 @@ class FakeCmd:
     def stop(self):
         self.state = "stopped"
 
+    def complete(self):
+        self.state = "completed"
+
     def take_new_output(self):
         out = self._new_output
         self._new_output = ""
@@ -53,6 +56,15 @@ class FakeRegistry:
         self.calls.append(("connect", host, username, port))
         return SimpleNamespace(session_id="mcp-fake")
 
+    def connect_serial(self, port, baudrate):
+        self.calls.append(("connect-serial", port, baudrate))
+        return SimpleNamespace(
+            session_id="mcp-serial-fake",
+            conn_type="serial",
+            serial_port=port,
+            baudrate=baudrate,
+        )
+
     def disconnect(self):
         self.calls.append(("disconnect",))
 
@@ -61,6 +73,10 @@ class FakeRegistry:
 
     def start_command(self, command):
         self.calls.append(("start", command))
+        return self.cmd
+
+    def start_console_read(self):
+        self.calls.append(("read-console",))
         return self.cmd
 
     def find_command(self, command_id=""):
@@ -80,7 +96,12 @@ class FakeRegistry:
 
     def require(self):
         self.calls.append(("require",))
-        return SimpleNamespace(session_id="mcp-fake", target="ssh:fake", host="fake")
+        return SimpleNamespace(
+            session_id="mcp-fake",
+            conn_type="ssh",
+            target="ssh:fake",
+            host="fake",
+        )
 
     def reconnect(self, timeout=90.0, poll_interval=5.0):
         self.calls.append(("reconnect", timeout))
@@ -216,6 +237,23 @@ class TestPersistentToolWiring:
         assert result.startswith("Error")
         assert ("disconnect",) in reg.calls
 
+    def test_connect_serial_with_initial_console_output(self, monkeypatch):
+        reg = FakeRegistry(FakeCmd(state="completed", output="U-Boot 2024.01"))
+        monkeypatch.setattr(mcp_server, "REGISTRY", reg)
+        result = mcp_server.connect_serial("/dev/ttyUSB0", 1500000, listen_seconds=0)
+        assert "Connected: serial /dev/ttyUSB0@1500000" in result
+        assert "no exit status" in result
+        assert ("connect-serial", "/dev/ttyUSB0", 1500000) in reg.calls
+
+    def test_read_console_uses_read_only_command(self, monkeypatch):
+        cmd = FakeCmd(state="completed", output="Starting kernel...")
+        reg = FakeRegistry(cmd)
+        monkeypatch.setattr(mcp_server, "REGISTRY", reg)
+        result = mcp_server.read_console(wait_seconds=0)
+        assert "[c1 completed]" in result
+        assert "Starting kernel..." in result
+        assert ("read-console",) in reg.calls
+
     def test_reboot_uses_registry(self, monkeypatch):
         reg = FakeRegistry(FakeCmd(state="completed", exit_status=0, output="alive\nup 1 min"))
         monkeypatch.setattr(mcp_server, "REGISTRY", reg)
@@ -251,6 +289,7 @@ class TestMcpProtocol:
                 expected = {
                     "connect", "run", "send_input", "get_output", "stop_command",
                     "status", "disconnect", "upload_file", "download_file",
+                    "list_serial_ports", "connect_serial", "read_console",
                     "reboot_device", "snapshot_config", "execute_command",
                     "list_snapshots", "get_snapshot", "list_device_profiles",
                 }
