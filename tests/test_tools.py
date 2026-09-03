@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from tools import _classify_command, _clean_terminal_output
+from tools import TerminalOutputFilter, _classify_command, _clean_terminal_output
 
 
 class TestCommandClassifier:
@@ -102,6 +102,61 @@ class TestCleanTerminalOutput:
         result = _clean_terminal_output("\x1b]0;title\x07text")
         assert "text" in result
         assert "\x1b" not in result
+
+
+class TestTerminalOutputFilter:
+    """Stateful PTY cleaning across chunk boundaries."""
+
+    def test_progress_line_split_across_chunks(self):
+        cleaner = TerminalOutputFilter()
+        cleaner.push("Testing 1%\rTes")
+        cleaner.push("ting 99%")
+        cleaner.flush()
+        assert cleaner.render() == "Testing 99%"
+
+    def test_backspace_spinner_does_not_accumulate(self):
+        cleaner = TerminalOutputFilter()
+        cleaner.push("-\b\\\b|")
+        assert cleaner.active_line == "|"
+        cleaner.flush()
+        assert cleaner.render() == "|"
+
+    def test_split_csi_sequence_is_held_until_complete(self):
+        cleaner = TerminalOutputFilter()
+        cleaner.push("abc\x1b[")
+        cleaner.push("1Gx\n")
+        cleaner.flush()
+        assert cleaner.render() == "xbc"
+
+    def test_split_osc_sequence_is_held_until_complete(self):
+        cleaner = TerminalOutputFilter()
+        cleaner.push("\x1b]0;unused title\x07ok")
+        assert cleaner.active_line == "ok"
+
+    def test_active_spinner_is_not_delivered_as_stable_output(self):
+        cleaner = TerminalOutputFilter()
+        for frame in ("-", "\\", "|", "/"):
+            cleaner.push(frame + "\b")
+        assert cleaner.take_stable() == ""
+        # A final printable frame is retained once, not as every animation frame.
+        cleaner.push("-")
+        assert cleaner.flush() == "-\n"
+
+    def test_control_free_spinner_flood_is_bounded(self):
+        cleaner = TerminalOutputFilter()
+        cleaner.push("-\\|/" * 10_000)
+        rendered = cleaner.render()
+        assert len(rendered) < 500
+        assert "dynamic output suppressed" in rendered
+
+    def test_screen_is_bounded(self):
+        cleaner = TerminalOutputFilter()
+        for index in range(TerminalOutputFilter.MAX_SCREEN_LINES + 100):
+            cleaner.push(f"line-{index}\n")
+        cleaner.flush()
+        rendered = cleaner.render()
+        assert len(cleaner._rows) <= TerminalOutputFilter.MAX_SCREEN_LINES
+        assert "earlier output lines dropped" in rendered
 
 
 class TestConcurrentLocks:

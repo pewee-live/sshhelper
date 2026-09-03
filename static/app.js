@@ -70,11 +70,46 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentConnType = 'ssh';
     let ws = null;
     let currentTerminalBlock = null;
+    let terminalOutput = '';
+    let terminalFrameRequested = false;
     let activeSessionId = null;
     let intentionalClose = false;     // distinguishes user disconnect from network drop
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let currentSessionUsage = null;   // last-known token usage for the active session
+    const TERMINAL_MAX_CHARS = 200_000;
+
+    function resetTerminalOutput() {
+        terminalOutput = '';
+        terminalFrameRequested = false;
+    }
+
+    function renderTerminalOutput() {
+        terminalFrameRequested = false;
+        if (!terminalOutput) return;
+        if (!currentTerminalBlock) {
+            currentTerminalBlock = document.createElement('div');
+            currentTerminalBlock.className = 'terminal-log msg';
+            messageFeed.appendChild(currentTerminalBlock);
+        }
+        const shouldStickToBottom =
+            messageFeed.scrollHeight - messageFeed.scrollTop - messageFeed.clientHeight < 80;
+        currentTerminalBlock.textContent = terminalOutput;
+        if (shouldStickToBottom) messageFeed.scrollTop = messageFeed.scrollHeight;
+    }
+
+    function appendTerminalOutput(content, replace = false) {
+        terminalOutput = replace ? String(content || '') : terminalOutput + String(content || '');
+        if (terminalOutput.length > TERMINAL_MAX_CHARS) {
+            const dropped = terminalOutput.length - TERMINAL_MAX_CHARS;
+            terminalOutput = terminalOutput.slice(-TERMINAL_MAX_CHARS);
+            terminalOutput = `[... ${dropped} earlier terminal characters dropped ...]\n` + terminalOutput;
+        }
+        if (!terminalFrameRequested) {
+            terminalFrameRequested = true;
+            requestAnimationFrame(renderTerminalOutput);
+        }
+    }
 
     // Fetch initial sessions
     async function loadSessions() {
@@ -663,10 +698,12 @@ document.addEventListener('DOMContentLoaded', () => {
             
             appendMessage(data.content, 'msg-user');
             currentTerminalBlock = null;
+            resetTerminalOutput();
         }
         else if (data.type === 'agent_message') {
             appendMessage(data.content, 'msg-agent');
             currentTerminalBlock = null;
+            resetTerminalOutput();
         }
         else if (data.type === 'reasoning') {
             // Collapsible reasoning/thinking trace (like DeepSeek's UI).
@@ -689,6 +726,7 @@ document.addEventListener('DOMContentLoaded', () => {
             messageFeed.appendChild(wrapper);
             scrollToBottom();
             currentTerminalBlock = null;
+            resetTerminalOutput();
         }
         else if (data.type === 'tool_call') {
             const div = document.createElement('div');
@@ -705,16 +743,10 @@ document.addEventListener('DOMContentLoaded', () => {
             messageFeed.appendChild(div);
             scrollToBottom();
             currentTerminalBlock = null;
+            resetTerminalOutput();
         }
         else if (data.type === 'log') {
-            // Append continuous terminal logs
-            if (!currentTerminalBlock) {
-                currentTerminalBlock = document.createElement('div');
-                currentTerminalBlock.className = 'terminal-log msg';
-                messageFeed.appendChild(currentTerminalBlock);
-            }
-            currentTerminalBlock.textContent += data.content;
-            scrollToBottom();
+            appendTerminalOutput(data.content, !!data.replace);
         }
         else if (data.type === 'password_request') {
             passwordPromptText.textContent = data.prompt;

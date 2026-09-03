@@ -1,0 +1,50 @@
+#!/bin/bash
+# vpu-decode: decode video through the Allwinner CedarC VPU (GStreamer OMX).
+#
+# Usage:
+#   vpu-decode FILE            # max-speed decode benchmark (no display)
+#   vpu-decode --play FILE     # play with A/V sync (playbin auto-picks OMX)
+#
+# Supported codecs: h264 hevc vp9 vp8 mjpeg mpeg1/2/4 h263
+set -euo pipefail
+
+MODE="bench"
+FILE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bench) MODE="bench" ;;
+        --play)  MODE="play" ;;
+        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) FILE="$1" ;;
+    esac
+    shift
+done
+[[ -n "$FILE" && -f "$FILE" ]] || { echo "usage: vpu-decode [--play] FILE" >&2; exit 1; }
+
+codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+        -of csv=p=0 "$FILE" | head -n1)
+
+case "$codec" in
+    h264)        DEC=omxh264dec ;;
+    hevc)        DEC=omxhevcvideodec ;;
+    vp9)         DEC=omxvp9videodec ;;
+    vp8)         DEC=omxvp8videodec ;;
+    mjpeg)       DEC=omxmjpegvideodec ;;
+    mpeg1video)  DEC=omxmpeg1videodec ;;
+    mpeg2video)  DEC=omxmpeg2videodec ;;
+    mpeg4)       DEC=omxmpeg4videodec ;;
+    h263)        DEC=omxh263videodec ;;
+    *) echo "vpu-decode: codec '$codec' has no Allwinner OMX VPU decoder" >&2; exit 2 ;;
+esac
+
+echo "vpu-decode: file=$FILE codec=$codec decoder=$DEC mode=$MODE" >&2
+
+if [[ "$MODE" == "play" ]]; then
+    exec gst-launch-1.0 playbin "uri=file://$(readlink -f "$FILE")"
+fi
+
+exec gst-launch-1.0 -v \
+    filesrc "location=$FILE" \
+    ! parsebin \
+    ! "$DEC" \
+    ! fpsdisplaysink video-sink=fakesink sync=false text-overlay=false

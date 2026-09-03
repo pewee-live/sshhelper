@@ -3,6 +3,7 @@ import paramiko
 import serial
 import re
 import threading
+import sys
 from typing import Optional
 from getpass import getpass
 import os
@@ -17,6 +18,287 @@ _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 _CTRL_RE = re.compile(r'\x1b\][^\x07]*\x07|\x1b[=>]')
 
 
+class TerminalOutputFilter:
+    """Statefully normalize a PTY/serial stream across read chunks.
+
+    A stateless cleaner cannot implement terminal semantics.  A spinner sent as
+    ``-\\b\\\\\\b|\\b`` becomes ``-\\\\|`` when backspaces are merely deleted,
+    and a progress line split across reads can leak every animation frame.  This
+    filter keeps a bounded terminal screen, applies CR/BS/cursor/erase commands,
+    exposes only finalized lines to agents, and throttles live screen snapshots
+    sent to the browser.
+    """
+
+    MAX_SCREEN_LINES = 5000
+    MAX_ROW_CHARS = 8192
+    MAX_RENDER_CHARS = 128_000
+    MAX_LIVE_CHARS = 64_000
+    LIVE_INTERVAL = 0.5
+
+    _CSI_RE = re.compile(r'^\x1b\[([0-9;?]*)([A-Za-z])')
+    _OSC_RE = re.compile(r'^\x1b\].*?(?:\x07|\x1b\\)', re.DOTALL)
+    _PRINTABLE_RE = re.compile(r'[^\x00-\x1f\x7f]')
+    _MEANINGFUL_RE = re.compile(r'[^\W_]+', re.UNICODE)
+
+    def __init__(self):
+        # Screen state is used for interactive rendering; finalized lines are a
+        # stable transcript for LLM/MCP consumers.
+        self._rows = [[]]
+        self._row = 0
+        self._col = 0
+        self._pending = ""
+        self._stable_lines = []
+        self._stable_cursor = 0
+        self._dropped_rows = 0
+
+        self._last_live_time = 0.0
+        self._last_live_fingerprint = None
+
+    def _ensure_row(self, row: int):
+        while row >= len(self._rows):
+            self._rows.append([])
+            if len(self._rows) > self.MAX_SCREEN_LINES:
+                self._rows.pop(0)
+                row -= 1
+                self._row = row
+                self._dropped_rows += 1
+
+    def _put_char(self, char: str):
+        self._ensure_row(self._row)
+        row = self._rows[self._row]
+        if self._col > self.MAX_ROW_CHARS:
+            # Keep the head marker and resume at the end; extremely wide lines
+            # are almost always binary/noise rather than useful diagnostics.
+            self._col = self.MAX_ROW_CHARS
+        while len(row) <= self._col:
+            row.append(" ")
+        row[self._col] = char
+        self._col += 1
+
+    def _erase_in_line(self, mode: int):
+        self._ensure_row(self._row)
+        row = self._rows[self._row]
+        if mode == 0:
+            del row[self._col:]
+        elif mode == 1:
+            del row[:self._col]
+            self._col = 0
+        else:
+            row.clear()
+            self._col = 0
+
+    def _erase_in_display(self, mode: int):
+        if mode == 2 or (mode == 0 and self._row == 0 and self._col == 0):
+            self._rows = [[]]
+            self._row = self._col = 0
+            return
+        self._ensure_row(self._row)
+        if mode == 0:
+            del self._rows[self._row][self._col:]
+            del self._rows[self._row + 1:]
+        elif mode == 1:
+            del self._rows[:self._row]
+            self._row = 0
+            self._erase_in_line(2)
+            self._ensure_row(0)
+
+    def _handle_csi(self, params: str, final: str):
+        try:
+            raw = [int(p) for p in params.split(";") if p.isdigit()]
+        except ValueError:
+            raw = []
+        count = raw[0] if raw else 1
+
+        if final == "A":
+            self._row = max(0, self._row - max(1, count))
+        elif final in ("B", "e"):
+            self._row += max(1, count)
+            self._ensure_row(self._row)
+        elif final in ("C", "a"):
+            self._col = max(0, self._col + max(1, count))
+        elif final == "D":
+            self._col = max(0, self._col - max(1, count))
+        elif final == "G":
+            self._col = max(0, count - 1)
+        elif final in ("H", "f"):
+            row = max(1, raw[0] if len(raw) > 0 else 1) - 1
+            col = max(1, raw[1] if len(raw) > 1 else 1) - 1
+            self._row, self._col = row, col
+            self._ensure_row(row)
+        elif final == "J":
+            self._erase_in_display(raw[0] if raw else 0)
+        elif final == "K":
+            self._erase_in_line(raw[0] if raw else 0)
+        elif final == "L":
+            for _ in range(max(1, count)):
+                self._rows.insert(self._row, [])
+        elif final == "M":
+            for _ in range(min(max(1, count), len(self._rows) - self._row)):
+                self._rows.pop(self._row)
+        # SGR and less common sequences intentionally have no visible effect.
+
+    def _finish_pending(self) -> bool:
+        if not self._pending:
+            return True
+
+        osc = self._OSC_RE.match(self._pending)
+        if osc:
+            self._pending = self._pending[osc.end():]
+            return True
+
+        if self._pending.startswith("\x1b]"):
+            # An unterminated OSC sequence must wait for its terminator.
+            return False
+
+        csi = self._CSI_RE.match(self._pending)
+        if csi:
+            self._handle_csi(csi.group(1), csi.group(2))
+            self._pending = self._pending[csi.end():]
+            return True
+
+        if self._pending.startswith("\x1b["):
+            return False
+
+        if self._pending.startswith("\x1b"):
+            if len(self._pending) >= 2:
+                command = self._pending[1]
+                if command == "7":
+                    # DECSC: cursor position only; character attributes are ignored.
+                    self._saved_cursor = (self._row, self._col)
+                elif command == "8":
+                    row, col = getattr(self, "_saved_cursor", (0, 0))
+                    self._row, self._col = row, col
+                elif command == "M":
+                    self._row = max(0, self._row - 1)
+                elif command == "D":
+                    self._row += 1
+                self._pending = self._pending[2:]
+                return True
+            return False
+        self._pending = ""
+        return True
+
+    def _newline(self):
+        self._ensure_row(self._row)
+        line = "".join(self._rows[self._row]).rstrip()
+        self._stable_lines.append(line)
+        if len(self._stable_lines) > self.MAX_SCREEN_LINES:
+            cut = len(self._stable_lines) - self.MAX_SCREEN_LINES
+            self._stable_lines = self._stable_lines[cut:]
+            self._stable_cursor = max(0, self._stable_cursor - cut)
+        self._row += 1
+        self._col = 0
+        self._ensure_row(self._row)
+
+    def push(self, raw: str):
+        self._pending += raw
+        pos = 0
+        while pos < len(self._pending):
+            # Keep partial escape sequences for the next read chunk.
+            if self._pending[pos] == "\x1b":
+                self._pending = self._pending[pos:]
+                if not self._finish_pending():
+                    return
+                # A complete sequence was consumed; continue processing any
+                # ordinary characters that arrived in the same read chunk.
+                pos = 0
+                continue
+
+            char = self._pending[pos]
+            pos += 1
+            if char == "\n":
+                self._newline()
+            elif char == "\r":
+                self._col = 0
+            elif char == "\x08":
+                self._col = max(0, self._col - 1)
+            elif char == "\t":
+                next_tab = (self._col // 8 + 1) * 8
+                while self._col < next_tab:
+                    self._put_char(" ")
+            elif char >= " " and char != "\x7f":
+                self._put_char(char)
+
+        self._pending = self._pending[pos:]
+        self._finish_pending()
+
+    @staticmethod
+    def _collapse_noise(text: str) -> str:
+        """Bound control-free spinner/progress floods as a final safety net."""
+        def mixed(match):
+            chars = match.group(0)
+            return f"[dynamic output suppressed: {len(chars)} chars]"
+
+        # A long mixed run composed solely of common spinner/progress glyphs is
+        # not useful transcript content.  Short separators remain untouched.
+        text = re.sub(r'[-\\|/*+oO.#@°○◯ ]{60,}', mixed, text)
+
+        def repeated(match):
+            char = match.group(1)
+            count = len(match.group(0))
+            return f"{char * 8}[repeated {count} chars]"
+
+        text = re.sub(r'(.)\1{199,}', repeated, text)
+        return text
+
+    def render(self, max_chars: int = MAX_RENDER_CHARS) -> str:
+        rows = self._rows[:self._row + 1]
+        text = "\n".join("".join(row).rstrip() for row in rows).rstrip("\n")
+        if self._dropped_rows:
+            text = f"[... {self._dropped_rows} earlier output lines dropped ...]\n" + text
+        text = self._collapse_noise(text)
+        if len(text) <= max_chars:
+            return text
+        keep = max_chars // 2
+        return (
+            text[:keep]
+            + f"\n[... {len(text) - max_chars} middle output characters dropped ...]\n"
+            + text[-keep:]
+        )
+
+    def take_stable(self) -> str:
+        """Return finalized lines not yet delivered to an LLM/MCP caller."""
+        if self._stable_cursor >= len(self._stable_lines):
+            return ""
+        chunk = "\n".join(self._stable_lines[self._stable_cursor:]) + "\n"
+        self._stable_cursor = len(self._stable_lines)
+        return chunk
+
+    def flush(self):
+        """Finish the active row and return any newly stable transcript text."""
+        active = self.active_line
+        if active or self._col:
+            self._stable_lines.append(active)
+        self._row += 1
+        self._col = 0
+        self._ensure_row(self._row)
+        return self.take_stable()
+
+    @property
+    def active_line(self) -> str:
+        self._ensure_row(self._row)
+        return "".join(self._rows[self._row]).rstrip()
+
+    def tail(self, lines: int = 8) -> str:
+        source = self._stable_lines + ([self.active_line] if self.active_line else [])
+        return "\n".join(source[-max(1, lines):])
+
+    def poll_live(self, force: bool = False) -> str:
+        """Return a bounded full-screen snapshot for a replace-style UI event."""
+        now = time.monotonic()
+        display = self.render(self.MAX_LIVE_CHARS)
+        # Spinner-only changes have no alphanumeric fingerprint.  Suppress them
+        # instead of repainting the browser at hundreds of frames per second.
+        fingerprint = tuple(self._MEANINGFUL_RE.findall(display))
+        changed = fingerprint != self._last_live_fingerprint
+        due = force or (changed and now - self._last_live_time >= self.LIVE_INTERVAL)
+        if not due or not display:
+            return ""
+        self._last_live_time = now
+        self._last_live_fingerprint = fingerprint
+        return display + "\n"
+
+
 def _clean_terminal_output(text: str) -> str:
     """Strip ANSI escape codes and normalize carriage-return progress bars.
 
@@ -25,25 +307,10 @@ def _clean_terminal_output(text: str) -> str:
     frame, producing a wall of junk. We keep only the last segment of each
     '\\r'-delimited line so the output shows the final state, not every frame.
     """
-    # Remove ANSI escape sequences.
-    text = _ANSI_RE.sub('', text)
-    text = _CTRL_RE.sub('', text)
-    # Normalize CRLF -> LF, then handle \r-only (progress bar overwrite).
-    text = text.replace('\r\n', '\n')
-    # For each \r, keep only the content after the last \r on that line segment
-    # (this collapses "downloading... 1%\rdownloading... 2%\r..." into the final state).
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        if '\r' in line:
-            # Keep the last segment after the final \r (the final state of the progress line)
-            cleaned_lines.append(line.split('\r')[-1])
-        else:
-            cleaned_lines.append(line)
-    result = '\n'.join(cleaned_lines)
-    # Remove other control characters except \n and \t.
-    result = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', result)
-    return result
+    cleaner = TerminalOutputFilter()
+    cleaner.push(text)
+    cleaner.flush()
+    return cleaner.render()
 
 
 import audit
@@ -144,6 +411,44 @@ INTERVENTION_COOLDOWN = 45.0
 # exits naturally.
 PROMPT_DETECT_MIN_IDLE = 0.3
 
+# Full-screen / interactive programs that would deadlock a non-interactive PTY.
+BLOCKED_INTERACTIVE_TOOLS = {
+    "htop", "vi", "vim", "nano", "ncdu", "tmux", "screen", "minicom",
+}
+
+
+def find_blocked_interactive_apps(command: str) -> list:
+    """Return the blocked full-screen apps referenced by a shell command."""
+    blocked = []
+    for token in command.split():
+        clean_token = re.sub(r"['\"`()&|;<>~]", '', token)
+        base_name = os.path.basename(clean_token)
+        if base_name in BLOCKED_INTERACTIVE_TOOLS:
+            blocked.append(base_name)
+    return blocked
+
+
+def safety_firewall_error(command: str) -> Optional[str]:
+    """Shared safety firewall for all execution paths (Web/CLI/MCP).
+
+    Returns an error message when the command must be rejected, else None.
+    """
+    blocked = find_blocked_interactive_apps(command)
+    if blocked:
+        blocked_str = ", ".join(sorted(set(blocked)))
+        return (
+            f"Error: Command rejected by safety firewall. '{blocked_str}' is an "
+            "interactive/full-screen program which causes terminal deadlocks. "
+            "Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
+        )
+    if "sensors-detect" in command and "--auto" not in command:
+        return (
+            "Error: Command rejected by safety firewall. 'sensors-detect' is interactive "
+            "and will wait for user input indefinitely, causing the agent to hang. "
+            "Please use 'sensors-detect --auto' instead."
+        )
+    return None
+
 
 def _cli_intervention(context, session_id=None):
     """Default (CLI) intervention handler: ask on the local terminal."""
@@ -209,7 +514,11 @@ class ConnectionManager:
         self._locks_guard = threading.Lock()
 
         # Callbacks that can be overridden by the Web server
-        self.on_output = lambda text, session_id=None: print(text, end='', flush=True)
+        # `replace=True` denotes a full terminal-screen snapshot for a live UI.
+        # The CLI prints only finalized chunks; the web UI consumes snapshots.
+        self.on_output = lambda text, session_id=None, replace=False: (
+            None if replace else print(text, end='', flush=True)
+        )
         self.on_password_request = lambda prompt, session_id=None: getpass(prompt)
         self.on_state_change = lambda state, session_id=None: None
         # Human-in-the-loop intervention when a command stalls waiting for input.
@@ -270,6 +579,10 @@ class ConnectionManager:
         conn.ssh_client = paramiko.SSHClient()
         conn.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         conn.ssh_client.connect(hostname=host, port=port, username=username, password=password, timeout=10)
+        # Keep long-lived MCP/agent sessions alive across NAT/idle timeouts.
+        transport = conn.ssh_client.get_transport()
+        if transport:
+            transport.set_keepalive(15)
         # Persist credentials into the encrypted vault so reconnect (after a
         # reboot) and the audit trail can work without a live plaintext copy.
         try:
@@ -281,7 +594,7 @@ class ConnectionManager:
                 secret=password,
             )
         except Exception as e:
-            print(f"[vault] failed to store credential: {e}")
+            print(f"[vault] failed to store credential: {e}", file=sys.stderr)
         audit.record(session_id=session_id, device=f"ssh:{host}", command=f"<connect {username}@{host}:{port}>", exit_status=0, source="ui")
         return f"Successfully connected to SSH at {host}:{port}"
 
@@ -306,7 +619,7 @@ class ConnectionManager:
                 conn.active_channel.sendall(b'\x03')
                 conn.active_channel.close()
             except Exception as e:
-                print(f"Error during SSH command interrupt: {e}")
+                print(f"Error during SSH command interrupt: {e}", file=sys.stderr)
             finally:
                 conn.active_channel = None
 
@@ -314,7 +627,7 @@ class ConnectionManager:
             try:
                 conn.serial_client.write(b'\x03')
             except Exception as e:
-                print(f"Error during Serial command interrupt: {e}")
+                print(f"Error during Serial command interrupt: {e}", file=sys.stderr)
 
     def reconnect(self, session_id: Optional[str] = None, timeout: float = 120.0, poll_interval: float = 5.0) -> bool:
         """Attempt to re-establish a connection to the same device using the
@@ -356,7 +669,7 @@ class ConnectionManager:
             except Exception as e:
                 last_err = e
                 time.sleep(poll_interval)
-        print(f"[reconnect] gave up after {timeout}s: {last_err}")
+        print(f"[reconnect] gave up after {timeout}s: {last_err}", file=sys.stderr)
         return False
 
     def upload_file(self, local_path: str, remote_path: str, session_id: Optional[str] = None) -> str:
@@ -422,7 +735,7 @@ class ConnectionManager:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"[{timestamp}] [{target}] {command}\n")
         except Exception as e:
-            print(f"Failed to log command: {e}")
+            print(f"Failed to log command: {e}", file=sys.stderr)
 
     def get_device_key(self, session_id: Optional[str] = None) -> Optional[str]:
         """Return a stable identifier for the currently-connected device, used to
@@ -483,24 +796,10 @@ class ConnectionManager:
             return self._execute_impl(command, session_id)
 
     def _execute_impl(self, command: str, session_id: Optional[str] = None) -> str:
-        # --- Safety Firewall ---
-        # Prevent the LLM from blindly running full-screen interactive CLI apps
-        # that would trap our PTY terminal in an infinite display loop.
-        import re
-        interactive_tools = {"htop", "vi", "vim", "nano", "ncdu", "tmux", "screen", "minicom"}
-        blocked_apps = []
-        for token in command.split():
-            clean_token = re.sub(r"['\"`()&|;<>~]", '', token)
-            base_name = os.path.basename(clean_token)
-            if base_name in interactive_tools:
-                blocked_apps.append(base_name)
-
-        if blocked_apps:
-            blocked_str = ", ".join(set(blocked_apps))
-            return f"Error: Command rejected by safety firewall. '{blocked_str}' is an interactive/full-screen program which causes terminal deadlocks. Please use non-interactive alternatives (e.g., 'cat', 'sed -i', 'top -b -n 1')."
-
-        if "sensors-detect" in command and "--auto" not in command:
-            return "Error: Command rejected by safety firewall. 'sensors-detect' is interactive and will wait for user input indefinitely, causing the agent to hang. Please use 'sensors-detect --auto' instead."
+        # --- Safety Firewall (shared with the MCP server) ---
+        firewall_error = safety_firewall_error(command)
+        if firewall_error:
+            return firewall_error
 
         self._log_command(command, session_id)
         self.on_state_change("Executing...", session_id)
@@ -514,8 +813,7 @@ class ConnectionManager:
                 channel = stdout.channel
                 conn.active_channel = channel
 
-                output = ""
-                buffer = ""
+                cleaner = TerminalOutputFilter()
                 idle_seconds = 0.0
                 last_intervention = 0.0
 
@@ -527,22 +825,16 @@ class ConnectionManager:
                     if channel.recv_ready():
                         chunk_bytes = channel.recv(1024)
                         if chunk_bytes:
-                            chunk = _clean_terminal_output(chunk_bytes.decode('utf-8', errors='replace'))
-                            output += chunk
-                            buffer += chunk
+                            cleaner.push(chunk_bytes.decode('utf-8', errors='replace'))
                             got_data = True
                             idle_seconds = 0.0
-                            self.on_output(chunk, session_id)
 
                     if channel.recv_stderr_ready():
                         chunk_bytes = channel.recv_stderr(1024)
                         if chunk_bytes:
-                            chunk = _clean_terminal_output(chunk_bytes.decode('utf-8', errors='replace'))
-                            output += chunk
-                            buffer += chunk
+                            cleaner.push(chunk_bytes.decode('utf-8', errors='replace'))
                             got_data = True
                             idle_seconds = 0.0
-                            self.on_output(chunk, session_id)
 
                     if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                         break
@@ -550,7 +842,13 @@ class ConnectionManager:
                     if got_data:
                         continue
 
-                    last_line = self._last_line(buffer)
+                    # Snapshots are fingerprint-throttled: spinner-only changes
+                    # produce no browser event, while real text is limited to 2/s.
+                    display = cleaner.poll_live()
+                    if display:
+                        self.on_output(display, session_id, replace=True)
+
+                    last_line = cleaner.active_line
 
                     # Known password prompt -> ask for credentials
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
@@ -559,14 +857,12 @@ class ConnectionManager:
                             session_id,
                         )
                         channel.sendall((pwd + "\n").encode("utf-8"))
-                        buffer = ""
                         idle_seconds = 0.0
                         continue
 
                     # Known interactive pager stuck at (END)
                     if "(END)" in last_line:
                         channel.sendall(b"q\n")
-                        buffer = ""
                         idle_seconds = 0.0
                         self.on_output("\n[Agent] Detected interactive pager, automatically sending 'q' to exit...\n", session_id)
                         continue
@@ -584,14 +880,13 @@ class ConnectionManager:
                         elif decision["action"] == "send":
                             channel.sendall((decision.get("input", "") + "\n").encode("utf-8"))
                             self.on_output(f"\n[Agent] Sent user input: {decision.get('input', '')!r}\n", session_id)
-                        buffer = ""
                         idle_seconds = 0.0
                         last_intervention = time.time()
                         continue
 
                     # Generic stall fallback -> human intervention
                     if idle_seconds >= INTERVENTION_IDLE_TIMEOUT and (time.time() - last_intervention) >= INTERVENTION_COOLDOWN:
-                        context = "\n".join(buffer.strip().split("\n")[-8:]) or "(no output yet)"
+                        context = cleaner.tail(8) or "(no output yet)"
                         decision = self._request_intervention(context, session_id)
                         if decision["action"] == "abort":
                             try:
@@ -603,7 +898,6 @@ class ConnectionManager:
                         elif decision["action"] == "send":
                             channel.sendall((decision.get("input", "") + "\n").encode("utf-8"))
                             self.on_output(f"\n[Agent] Sent user input: {decision.get('input', '')!r}\n", session_id)
-                        buffer = ""
                         idle_seconds = 0.0
                         last_intervention = time.time()
                         continue
@@ -612,6 +906,13 @@ class ConnectionManager:
                     idle_seconds += 0.1
 
                 exit_status = channel.recv_exit_status()
+                cleaner.flush()
+                # The stable lines are already bounded. Use render() for the
+                # final result so cursor/erase commands are reflected correctly.
+                output = cleaner.render()
+                display = cleaner.poll_live(force=True)
+                if display:
+                    self.on_output(display, session_id, replace=True)
                 self.on_output("\n--- Command Finished ---\n", session_id)
 
                 # Record exit status into the audit log (companion to _log_command).
@@ -634,8 +935,7 @@ class ConnectionManager:
                 conn.serial_client.write(cmd_bytes)
 
                 self.on_output(f"\n--- Executing Serial Command: {command} ---\n", session_id)
-                output = ""
-                buffer = ""
+                cleaner = TerminalOutputFilter()
                 idle_time = 0.0
                 last_intervention = 0.0
                 SERIAL_DONE_TIMEOUT = 2.0
@@ -644,17 +944,17 @@ class ConnectionManager:
                     if conn.serial_client.in_waiting > 0:
                         idle_time = 0.0
                         try:
-                            chunk = _clean_terminal_output(conn.serial_client.read(conn.serial_client.in_waiting).decode('utf-8', errors='replace'))
-                            output += chunk
-                            buffer += chunk
-                            self.on_output(chunk, session_id)
+                            cleaner.push(conn.serial_client.read(conn.serial_client.in_waiting).decode('utf-8', errors='replace'))
                         except Exception as e:
                             err_msg = f"\n[Error reading partial output: {e}]\n"
-                            output += err_msg
                             self.on_output(err_msg, session_id)
                         continue
 
-                    last_line = self._last_line(buffer)
+                    display = cleaner.poll_live()
+                    if display:
+                        self.on_output(display, session_id, replace=True)
+
+                    last_line = cleaner.active_line
 
                     if any(kw in last_line for kw in PASSWORD_PROMPT_KEYWORDS):
                         pwd = self.on_password_request(
@@ -662,13 +962,11 @@ class ConnectionManager:
                             session_id,
                         )
                         conn.serial_client.write(f"{pwd}\r\n".encode("utf-8"))
-                        buffer = ""
                         idle_time = 0.0
                         continue
 
                     if "(END)" in last_line:
                         conn.serial_client.write(b"q\r\n")
-                        buffer = ""
                         idle_time = 0.0
                         self.on_output("\n[Agent] Detected interactive pager, automatically sending 'q' to exit...\n", session_id)
                         continue
@@ -685,7 +983,6 @@ class ConnectionManager:
                         elif decision["action"] == "send":
                             conn.serial_client.write((decision.get("input", "") + "\r\n").encode("utf-8"))
                             self.on_output(f"\n[Agent] Sent user input: {decision.get('input', '')!r}\n", session_id)
-                        buffer = ""
                         idle_time = 0.0
                         last_intervention = time.time()
                         continue
@@ -697,6 +994,8 @@ class ConnectionManager:
                     idle_time += 0.1
 
                 self.on_output("\n--- Command Finished ---\n", session_id)
+                cleaner.flush()
+                output = cleaner.render()
                 return f"OUTPUT:\n{output}\n" if output.strip() else "Command executed successfully, but produced no output."
             else:
                 return "Error: No active connection. Please ensure the agent is connected first."

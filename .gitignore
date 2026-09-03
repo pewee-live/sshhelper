@@ -63,3 +63,4 @@ data/*
 
 # Test cache
 .pytest_cache/
+.pytest_tmp/

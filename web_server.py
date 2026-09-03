@@ -243,6 +243,7 @@ intervention_values = {}    # session_id -> {"action", "input"}
 pending_interventions = {}  # session_id -> context text awaiting a human
 
 SESSION_EVENT_BUFFER_CAP = 1500
+MAX_LOG_EVENT_CHARS = 64_000
 
 
 def _is_running(session_id):
@@ -265,11 +266,20 @@ async def broadcast(session_id, event):
             pass
 
 
-def web_on_output(text: str, session_id: Optional[str] = None):
+def web_on_output(text: str, session_id: Optional[str] = None, replace: bool = False):
     """Stream terminal prints to the web interface (called from tool threads)."""
     sid = session_id or "_default"
-    event = {"type": "log", "content": text}
     buf = session_events.setdefault(sid, [])
+    if replace and buf:
+        # A screen snapshot supersedes earlier log events for replay. Keep
+        # status/tool events, but avoid buffering hundreds of full snapshots.
+        while buf and buf[-1].get("type") == "log":
+            buf.pop()
+    content = text
+    if len(content) > MAX_LOG_EVENT_CHARS:
+        marker = f"[... {len(content) - MAX_LOG_EVENT_CHARS} characters truncated ...]"
+        content = content[-MAX_LOG_EVENT_CHARS:] + marker
+    event = {"type": "log", "content": content, "replace": replace}
     buf.append(event)
     if len(buf) > SESSION_EVENT_BUFFER_CAP:
         del buf[: len(buf) - SESSION_EVENT_BUFFER_CAP]

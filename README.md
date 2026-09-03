@@ -18,7 +18,7 @@
 7. **人工干预 (Human-in-the-loop)**：当命令卡在敏感词防火墙之外的交互提示（如 `conda install` 的 `[y]/n`、`apt` 的 `Y/n`、`fdisk` 的菜单选择，或任何未预料的卡死）时，Agent 会自动挂起并弹出干预窗口，把最近的终端输出交给你判断，由你决定发送什么输入、中止命令，还是继续等待。CLI 模式同样支持在本地终端交互。
 8. **Token 预算驱动的上下文管理**：历史压缩不再按消息条数粗暴触发，而是依据大模型实际报告的 prompt token 用量——只有接近上下文窗口上限（默认 80%）时才压缩。压缩时优先保留原始目标与最近窗口、对冗长的命令输出做无损截断，仅在必要时对增量内容做摘要，杜绝「摘要套摘要」的信息衰减，大幅提升长会话质量。窗口大小可通过 `MODEL_CONTEXT_WINDOW` 环境变量配置。
 9. **闭环指令验证**：约束模型在对系统进行状态更改（如安装软件、修改系统配置）后，强制去执行相关的二次验证操作（如检查进程状态或获取版本号），自动防范执行失败导致的伪成功反馈。
-10. **高级 Web UI**：内置基于 FastAPI 和 WebSockets 的图形化页面，提供暗黑主题玻璃拟态界面、终端打字机效果输出以及直观的思考过程展示。
+10. **高级 Web UI**：内置基于 FastAPI 和 WebSockets 的图形化页面，提供暗黑主题玻璃拟态界面、终端输出以及直观的思考过程展示；终端流会跨 chunk 执行退格/回车/ANSI 光标语义，进度条和 spinner 只保留最终状态，浏览器端还有节流与内容硬上限，内存压测不会因刷屏卡死页面。
 11. **交互死锁防火墙**：在底层流处理与 Agent 认知级别双重设防，自动拦截或处理诸如 `htop`、`vim`、`less` 等会导致 PTY 终端永久挂起的命令。
 12. **非法调用自我修正 (Self-Correction)**：新增对模型输出错误 JSON 或格式破坏的识别隔离节点 `invalid_tools`，原生捕获非法请求并流转回主代理，强制模型重新反思修正，彻底避免因上下文状态缺失导致的 API Error 400 中断异常。
 13. **连接断线自动重连**：网络抖动、休眠或 WiFi 切换导致 WebSocket 断开时，前端会以指数退避自动重连并回放错过的输出。由于 Agent 任务运行在与连接解耦的后台，断线不会中断任何正在进行的诊断。
@@ -76,7 +76,9 @@ ssh-helper/
 ├── audit.py           # 不可篡改审计日志（append-only JSONL）
 ├── case_generator.py  # 自动案例生成（从会话历史提取结构化知识库案例）
 ├── external_api.py    # 外部 Agent RESTful API（/api/v1/tools/，自动生成 OpenAPI 文档）
-├── mcp_server.py      # MCP Server（将设备操作能力暴露为 MCP 工具，供 Claude/Cursor 等 AI 调用）
+├── mcp_server.py      # MCP Server（将设备操作能力暴露为 MCP 工具，供 Codex/Claude/Cursor 等 AI 调用）
+├── mcp_connections.py # MCP 持久连接注册表 + 非阻塞 PTY 命令运行器（connect 一次，run 多次）
+├── scripts/           # 专用工具（按能力域和SoC分类：device/ mcp/ soc/，见 scripts/README.md）
 ├── web_server.py      # 【推荐】Web 服务端入口，WebSocket 人机交互 + REST API 挂载
 ├── static/            # 前端 Web UI 资源 (index.html, style.css, app.js)
 ├── main.py            # 【旧版】CLI 纯命令行终端交互入口
@@ -224,17 +226,40 @@ curl -X POST "http://localhost:8000/api/v1/tools/search?q=ping%E4%B8%8D%E9%80%9A
 
 ## MCP Server（AI Agent 原生接入）
 
-除了 RESTful API，本项目还提供了标准的 [Model Context Protocol](https://modelcontextprotocol.io/) Server，让 Claude Desktop、Cursor、Cline 等 MCP 兼容的 AI Agent 即插即用地调用全部 14 个设备操作工具——不需要解析 API 文档，Agent 自己就能发现和调用。
+除了 RESTful API，本项目还提供了标准的 [Model Context Protocol](https://modelcontextprotocol.io/) Server，并内置**持久连接工作流**：`connect()` 一次，之后 `run()` 连续执行任意多条命令，全部复用同一条 SSH 连接。这正是 Codex、Claude Desktop、Cursor 等 Agent 需要的「连接一次、多次操作」模型。
+
+### 连接与命令模型
+
+- 连接状态保存在 MCP Server 进程内（`mcp_connections.ConnectionRegistry`），跨 tool call 存活；stdio 模式下进程随客户端（Codex 等）启动和退出。
+- `connect()` 默认从加密保险库取凭据（也可显式传 `password`），成功后自动开启 15s SSH keepalive，并执行一次 `uname -smr; hostname` 验证 exec 通道可用。
+- `run()` 在 PTY 上执行命令：命令完成返回 exit status + 输出；超时返回部分输出和 `command_id`（用 `get_output()` 继续轮询，长命令不会被杀掉）；遇到 sudo 密码或 `[y/n]` 确认时返回 `awaiting_input`，问过用户后用 `send_input()` 回答（密码不会被 PTY 回显）。
+- `htop/vim/nano` 等全屏交互命令会被共享安全防火墙直接拒绝，防止 PTY 死锁；同一连接同一时刻只允许一个活动命令。
+- 所有命令照常写入 append-only 审计日志（`source=mcp`），与 Web/CLI 共用同一份追溯体系。
 
 ### 快速启动
 
 ```bash
-# stdio 模式（默认，适用于 Claude Desktop / Cursor 等本地客户端）
+# stdio 模式（默认，适用于 Codex / Claude Desktop / Cursor 等本地客户端）
 python mcp_server.py
 
-# HTTP 模式（适用于远程 Agent 或 Web 端集成）
-python mcp_server.py --http
+# HTTP 模式（默认只绑定 127.0.0.1:8787；确需远程访问再 --host 0.0.0.0）
+python mcp_server.py --http --host 127.0.0.1 --port 8787
 ```
+
+建议先通过 Web UI（`http://localhost:8000`）把开发板凭据存入加密保险库，MCP 端 `connect()` 留空 `password` 即可，密码不会出现在任何模型上下文或工具参数里。
+
+### 在 Codex 中接入
+
+编辑 Codex 配置（Windows：`C:\Users\<你>\.codex\config.toml`；Linux/macOS：`~/.codex/config.toml`）：
+
+```toml
+[mcp_servers.sshhelper]
+command = 'C:\Users\<你>\.conda\envs\sshhelper\python.exe'
+args = ['D:\path\to\sshhelper\mcp_server.py']
+startup_timeout_sec = 60
+```
+
+重启 Codex 后直接说「连接我的开发板，然后依次跑 uname -a、uptime、free -m」，Codex 会自动调用 `connect` + 多次 `run`，全程复用同一条连接；每次工具调用仍会走 Codex 自己的审批界面。
 
 ### 在 Claude Desktop 中使用
 
@@ -244,25 +269,67 @@ python mcp_server.py --http
 {
   "mcpServers": {
     "hardware-tools": {
-      "command": "python",
-      "args": ["D:\\path\\to\\mcp_server.py"],
-      "env": {
-        "OPENAI_API_KEY": "your_key",
-        "OPENAI_BASE_URL": "https://open.bigmodel.cn/api/coding/paas/v4",
-        "OPENAI_MODEL": "glm-5.2"
-      }
+      "command": "C:\\Users\\you\\.conda\\envs\\sshhelper\\python.exe",
+      "args": ["D:\\path\\to\\sshhelper\\mcp_server.py"]
     }
   }
 }
 ```
 
-重启 Claude Desktop 后，你可以在对话中直接说「查一下 192.168.1.1 的 SNMP 信息」或「把这台设备的配置做一次快照」，Claude 会自动发现并调用对应的 MCP 工具。
+重启 Claude Desktop 后即可使用；MCP Server 是本地工具服务器，不需要配置任何 LLM API Key。
 
 ### 可用工具
 
-MCP Server 暴露的 14 个工具与 RESTful API 完全对等：
+**持久会话（推荐工作流）**：`connect` · `run` · `send_input` · `get_output` · `stop_command` · `status` · `disconnect` · `upload_file` · `download_file` · `reboot_device` · `snapshot_config` · `list_snapshots` · `get_snapshot`
 
-`execute_command` · `snmp_query` · `modbus_query` · `redfish_query` · `ipmi_query` · `upload_file` · `download_file` · `reboot_device` · `batch_run` · `list_device_groups` · `snapshot_config` · `diff_config` · `search_kb` · `get_device_profile`
+**无状态 / 其他能力**：`execute_command`（一次性 SSH，适合未 connect 的任意主机）· `snmp_query` · `modbus_query` · `redfish_query` · `ipmi_query` · `batch_run` · `list_device_groups` · `diff_config` · `search_kb` · `get_device_profile` · `list_device_profiles`
+
+交互链示例（sudo）：`run("apt update")` 返回 `[c3 awaiting_input hint=password]` → Agent 询问用户密码 → `send_input("<密码>")` → `get_output("c3", wait_seconds=10)` 拿到后续输出。
+
+---
+
+## ffmpeg-vpu（VPU 硬解版 ffmpeg，推流直播推荐）
+
+Debian 的 ffmpeg 没有任何 CedarC/V4L2 解码后端，但 Allwinner 的 `libcedarc`（`libvdecoder`）是可直连的厂商原生接口。本仓库在 ffmpeg 7.1.5 源码级集成了 CedarC 解码器（`scripts/soc/allwinner-a733/ffmpeg/cedar_dec.c`），并在板子上构建为独立的 `/usr/local/bin/ffmpeg-vpu`，不覆盖系统 ffmpeg。
+
+新增解码器：`h264_cedar`、`vp9_cedar`、`hevc_cedar`（HEVC 受限，见下）。
+
+### 实测性能（1080p60 / 1080p30，10 秒测试流）
+
+| 编码 | 软解 user CPU | VPU user CPU | 加速 |
+|------|--------------|--------------|------|
+| H.264 60fps | 8.5s | 1.3s | 6.7x |
+| VP9 30fps | ~6.9s | 0.3s | ~22x |
+
+端到端推流链路已验证：`VPU 解码 → x264 veryfast 6Mbps 重编码` 处理 1080p60 素材达到 **4.8 倍实时速度**（wall 12.8s 处理 10s 素材）；UDP MPEG-TS 实时直播闭环（`-re` 推流 8 秒、本机接收 471 帧 / 59.4fps）全部收齐。RTMP 推流直接用 `-f flv rtmp://...` 即可，FLV 容器输出已验证可正常回放。
+
+### 使用示例
+
+```bash
+# VPU 纯解码基准
+ffmpeg-vpu -benchmark -c:v h264_cedar -i input.mp4 -f null -
+
+# 解码 + 转码推 RTMP（直播）
+ffmpeg-vpu -re -c:v h264_cedar -i input.mp4 \
+  -c:v libx264 -preset veryfast -b:v 4M \
+  -f flv rtmp://your-server/live/streamkey
+```
+
+### 构建方法（在板子上）
+
+```bash
+sudo apt install -y build-essential nasm pkg-config libx264-dev
+cd /tmp && curl -LO https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n7.1.5.tar.gz && tar xzf n7.1.5.tar.gz && mv FFmpeg-n7.1.5 ffmpeg-n7.1.5
+# 上传 scripts/soc/allwinner-a733/ffmpeg/cedar_dec.c 到 /tmp/ 后：
+bash scripts/soc/allwinner-a733/ffmpeg/build.sh
+sudo install -m 755 /tmp/ffmpeg-n7.1.5/ffmpeg /usr/local/bin/ffmpeg-vpu
+```
+
+### 已知限制
+
+- `hevc_cedar` 默认禁用：这版 `libvdecoder` 的 HEVC 路径存在厂商级堆损坏 bug（官方 `vdecoderdemo` 同样崩溃）。设 `FFMPEG_VPU_HEVC=1` 可强制试开。
+- 解码器关闭时会打印两条 `ion_alloc_vir2phy failed` 错误：厂商库 teardown 阶段清理内部指针导致，不影响解码结果与进程退出码。
+- 文件末尾最后一帧在 EOS flush 中可能丢失（600 帧收 599），直播场景无影响。
 
 ---
 
